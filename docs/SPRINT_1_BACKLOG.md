@@ -74,9 +74,12 @@ independently runnable project.
   CLI-arg-configurable port with a documented default is sufficient, final allocation strategy
   can follow in S1-04/later.
 - Auth-check middleware: every request (except perhaps `/health` itself, for simple liveness
-  probing — product owner's call) must carry a shared-secret token matching an env-var the process
-  was launched with; mismatched/missing token → 401. The token itself is generated and propagated
-  by S1-04 — this ticket just needs to enforce it once present (`docs/DECISIONS.md` D-009).
+  probing — product owner's call) must carry a shared-secret token matching the installed session
+  credential; mismatched/missing token → 401. The token itself is generated and propagated
+  by S1-04 over private pipes/handles in supervised mode; an env var is only the standalone test
+  setup. No evidence/business endpoint is available until a credential is installed. The bounded
+  startup challenge is the explicit pre-authentication protocol exception (D-025); missing
+  configuration must never disable authentication.
 - Python dependency management set up (e.g. `pyproject.toml`).
 
 **Non-goals:** No database, no real business logic endpoints yet.
@@ -104,8 +107,8 @@ process-lifecycle implications
 - On app start, Tauri launches the exact bundled FastAPI service executable it shipped (not a
   PATH-resolved lookup) as a child process.
 - Tauri generates a one-time **startup secret**, distinct from the D-009 session token, and
-  supplies it to the child through a private inherited channel (an inherited pipe/handle, or an
-  environment variable read once at process start) — this is step 1 of the D-018 identity-
+  supplies it to the child through private inherited pipes/handles supporting communication in both
+  directions, accessible only to the parent and intended child — this is step 1 of the D-018 identity-
   verification handshake, required *before* any port/token exchange happens.
 - The child binds a loopback port using OS-assigned allocation (bind to port 0, let the OS choose
   and atomically reserve it) rather than a separate "find a free port, then bind" step — this
@@ -116,10 +119,12 @@ process-lifecycle implications
   correctly computed from the startup secret — confirming the process on that port is the one Tauri
   spawned — without ever sending the startup secret itself over HTTP.
 - Only after that verification succeeds does Tauri generate the random per-launch **session token**
-  (`docs/DECISIONS.md` D-009), pass it to the FastAPI child via environment variable (never a CLI
-  argument), and separately expose it to the frontend via Tauri's own IPC (not over the local HTTP
-  channel) so the frontend can attach it to every request. The token lives only in memory for the
-  session.
+  (`docs/DECISIONS.md` D-009), send it over the private pipe/handle channel, and wait for the child's
+  acknowledgement that authentication is ready. Only then expose the endpoint/token to the frontend
+  via Tauri IPC. Environment variables are startup snapshots, not a return channel or a way to
+  update an already-running child. Startup credential delivery uses only the private channel;
+  subsequent authenticated HTTP requests carry the session token. Never place credentials in CLI
+  arguments or logs. The token lives only in memory for the session (D-025).
 - **Fail closed**: if the child exits, fails to bind, fails to respond within a bounded timeout, or
   fails challenge verification, no endpoint or token is ever exposed to the frontend, and Tauri does
   not attempt to connect to whatever else may be listening on any port as a fallback.
@@ -138,14 +143,16 @@ be a later hardening ticket if needed.
 **Acceptance criteria:** Launching the Tauri app starts the service and completes the full
 identity-verification handshake before exposing anything to the frontend; the frontend displays a
 successful health check; closing the app leaves no orphaned `python`/service process running
-(verified manually via OS process list during review); a test that pre-occupies the target port
-with an unrelated listener (or a fake service that doesn't know the startup secret) demonstrates
-that Tauri fails closed — no token or request is sent to it.
+(verified manually via OS process list during review). Inject a fake endpoint into the test's
+startup transport to demonstrate that Tauri fails closed without sending a token or evidence to
+it. Port 0 must allocate another available port when an unrelated listener exists; do not assume
+it selects a particular occupied port. Exercise private-channel port/token exchange, replayed/wrong
+challenge, child exit and readiness timeout per D-025.
 
 **Required tests:** Manual verification steps documented in the PR description (process lifecycle
 is hard to unit test meaningfully at this stage); at minimum, an automated check that the
 frontend→service call succeeds in a dev/CI-runnable way, and an automated or documented-manual test
-of the fail-closed port-occupied scenario above.
+of the fail-closed fake-endpoint and port-allocation scenarios above.
 
 ---
 
@@ -244,12 +251,15 @@ whichever agent completes S1-04
   (resolved cleanly / needs a follow-up mitigation ticket) instead of leaving it as a forward-
   looking flag.
 
-**Non-goals:** No packaging/installer work (that's Sprint 16) — this is dev-mode validation only.
+**Non-goals:** No production installer polish (Sprint 16). This validation must include S1-09's
+packaged-build result, not just the development-mode loop.
 
-**Dependencies:** S1-04, S1-07.
+**Dependencies:** S1-04, S1-07, S1-09.
 
 **Acceptance criteria:** Sign-off recorded (e.g. as a comment/update on this backlog or in
-`DECISIONS.md`) that Sprint 1's exit criteria are met.
+`DECISIONS.md`) that Sprint 1's exit criteria are met, including S1-09's recorded clean-machine
+result. A failed spike cannot be marked passed: record the blocker and mitigation and obtain the
+product owner's explicit go/no-go decision before Sprint 2 proceeds.
 
 **Required tests:** N/A.
 

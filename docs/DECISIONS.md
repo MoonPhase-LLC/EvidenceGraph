@@ -248,8 +248,8 @@ no single place to record the *configuration* under which a batch of Mapping Can
 produced (model version, framework version, parser/chunker version, prompt version), which matters
 for provenance and reproducibility.
 
-**Decision:** Add an `AnalysisRun` entity: one row per analysis attempt against an artifact (or a
-batch of artifacts analyzed together), with a status of `succeeded` / `succeeded_no_mappings` /
+**Decision:** Add an `AnalysisRun` entity: one row per analysis attempt against one artifact
+(batch operations create independent runs, clarified by D-025), with an original status of `succeeded` / `succeeded_no_mappings` /
 `failed` / `superseded`, and immutable configuration-identity fields (see D-013). Every
 `Mapping Candidate` gets a required `analysis_run_id` FK instead of loosely-typed
 `model_provider`/`model_identifier`/`model_version` columns duplicated per row.
@@ -402,12 +402,14 @@ it safe to rely on.
 process (threat A2 in `SECURITY.md`) can reach a `127.0.0.1`-bound port without needing network
 access at all, so the service needs its own authentication independent of network binding.
 
-**Decision:** The Tauri host generates a random per-launch shared secret at app start, passes it to
-the FastAPI child process via an environment variable (never a CLI argument, which would be visible
-in the process list/`ps` output), and passes the same value to the frontend via Tauri's IPC (not
-over the local HTTP channel itself). Every request from the frontend to the local service must
+**Decision (delivery amended by D-025):** After service-identity verification, the Tauri host
+generates a random per-launch session secret, sends it to the child over private inherited
+pipes/handles, waits for authentication readiness, then exposes it to the frontend via Tauri IPC.
+Startup credential delivery never uses CLI arguments or HTTP. Subsequent requests from the
+frontend to the local service must
 include this secret as a bearer token / custom header. The service rejects any request missing or
-mismatching the token before doing any other work. The secret is held only in memory for the
+mismatching the token before doing any other work; the bounded startup challenge defined in D-025
+is the explicit pre-authentication protocol exception. The secret is held only in memory for the
 lifetime of the app session; it is never persisted to disk or logged. Localhost-only binding
 (`SECURITY.md` T-09) remains a defense-in-depth measure but is no longer the sole justification for
 skipping auth.
@@ -481,8 +483,8 @@ identity before any credential or evidence is sent to the HTTP endpoint:
 
 1. Tauri launches the exact bundled service executable it shipped (not a path resolved by PATH
    lookup or any mechanism an unrelated program could intercept), and supplies a one-time startup
-   secret through a private channel the child inherits at spawn (e.g. an inherited pipe/handle, or
-   an environment variable read once at process start and not otherwise exposed) — this startup
+   secret through private pipes/handles the child inherits at spawn, supporting both directions
+   and accessible only to the parent and intended child (D-025) — this startup
    secret is separate from, and a precursor to, the D-009 session token.
 2. The child binds a loopback port using OS-assigned port allocation (bind to port 0 and let the OS
    choose and atomically reserve an available port), avoiding the separate "find a free port, then
@@ -493,8 +495,11 @@ identity before any credential or evidence is sent to the HTTP endpoint:
    correctly computed from the startup secret from step 1 — proving the process answering on that
    port is the one Tauri spawned — without ever transmitting the startup secret itself over that
    HTTP channel.
-5. Only once verification succeeds does Tauri expose the verified endpoint and issue the D-009
-   session token to the frontend. If the child exits, fails to bind, fails to respond within a
+5. Once verification succeeds, Tauri generates the session token and delivers it through the
+   private channel, waits for the child's authentication-ready acknowledgement, then exposes the
+   verified endpoint/token to the frontend. Environment variables are not a bidirectional channel
+   and cannot deliver a newly generated token to a running child (D-025). If the child exits,
+   fails to bind, fails to respond within a
    bounded timeout, or fails challenge verification, startup fails closed: no endpoint or token is
    exposed to the frontend, and Tauri does not fall back to connecting to whatever else may be
    listening on any port.
@@ -533,7 +538,7 @@ determination:
 | Support present | At least one current, approved `SUPPORTS` mapping exists. |
 | Partial support present | At least one current, approved `PARTIALLY_SUPPORTS` mapping exists. |
 | Confirmed conflict | At least one current, approved `CONFLICTS_WITH` mapping exists. |
-| References only | At least one current, approved `REFERENCES` mapping exists, and neither of the two signals above is true. |
+| References only | At least one current, approved `REFERENCES` mapping exists, with no Support present, Partial support present, or Confirmed conflict signal. |
 | Review pending | At least one relevant Mapping Candidate is still `needs_review` (no Analyst Decision has been made, or it was reopened for review). |
 | Analysis incomplete | Analysis relevant to this control failed, is still pending, or only partially completed (`DECISIONS.md` D-020) — this signal means "don't trust an apparent absence of evidence yet," not "no evidence." |
 
@@ -572,13 +577,14 @@ one of `succeeded` / `partially_succeeded` / `failed` / `cancelled` / `interrupt
 `analysis_run_section_result` record is persisted per (run, artifact section) with: the section's
 evaluation outcome (`no_candidates_retrieved` / `evaluated_no_mappings` / `evaluated_with_mappings`
 / `failed`), a sanitized failure category where applicable (no evidence content, per `SECURITY.md`
-T-10), attempt count, and timestamps. `AnalysisRun.status` is derived from these per-section
-results: `succeeded` if every attempted section reached a non-`failed` outcome; `partially_succeeded`
-if at least one section succeeded and at least one failed; `failed` if every attempted section
-failed (or a fatal run-level error occurred before any section was processed, e.g. the model was
-unavailable at run start); `cancelled` for an explicit stop; `interrupted` for a run left in
-`running` state across an app restart, detected and relabeled rather than left ambiguously
-"running" forever.
+T-10), attempt count, and timestamps. **Amended by D-025:** rows start as `pending` for the entire
+intended section set before execution, with `running` also represented. Run lifecycle is persisted
+by the coordinator, not inferred solely from results. `succeeded` requires every intended section
+to reach a successful terminal outcome. A non-cancellation/non-interruption stop is
+`partially_succeeded` with some successful sections and some failed/unfinished, or `failed` with
+none successful. Explicit cancellation is `cancelled`; a running run found after restart becomes
+`interrupted`. Lifecycle stops take precedence over result aggregation and preserve all section
+outcomes. Sanitized run-level stop reasons distinguish startup failure from queued work.
 
 **Consequences:** One additional table (`analysis_run_section_result`) and a revised
 `analysis_run.status` enum (Sprint 8 migration, alongside `analysis_run` and `mapping_candidate`
@@ -696,7 +702,8 @@ identity or index configuration.
   support.
 - Model catalog entries (`MODEL_RUNTIME.md` §3) declare a `roles` field (`["generation"]`,
   `["embedding"]`, or both), and capability-specific fields apply only to the relevant role(s) (e.g.
-  `context_window` for generation; embedding dimensionality/normalization for embedding).
+  input-token limits/tokenizer identity for both roles, generation context/output budgeting, and
+  embedding dimensionality, normalization and a separate similarity metric; see D-025).
 - Hardware feasibility (`MODEL_RUNTIME.md` §5) must budget the **combined** memory/VRAM footprint
   when a generation model and a separate embedding model are configured to run simultaneously; if
   the combined footprint doesn't fit the detected hardware, the app supports **sequential loading**
@@ -705,8 +712,9 @@ identity or index configuration.
   unexplained crash.
 - `AnalysisRun` provenance (D-013) records the embedding model's identity separately from the
   generation model's: `embedding_model_identifier`, `embedding_model_version`,
-  `embedding_model_digest`, plus `embedding_dimensions`, `embedding_normalization`, and an
-  `embedding_config_version` (or digest covering model + preprocessing + normalization).
+  `embedding_model_digest`, plus `embedding_dimensions`, `embedding_normalization`,
+  `embedding_similarity_metric`, and an `embedding_config_version` (digest covering model +
+  preprocessing + normalization + metric).
 - Whenever the embedding configuration changes, any previously computed embedding index is treated
   as **incompatible** and must be rebuilt (or retrieval is clearly marked degraded until it is) —
   vectors produced under different embedding configurations must never be compared to each other.
@@ -777,6 +785,57 @@ a genuinely disconnected join-table in the ER diagram and an invalid-JSON exampl
 `DATABASE.md` §5 gains the explicit invariant list; the ER diagram and JSON example are corrected.
 No change to the product-visible decision workflow — this is entirely a correctness/audit-integrity
 fix underneath it.
+
+---
+
+## D-025: Complete startup IPC, run lifecycle, and Sprint 1 validation contracts
+
+**Status:** Accepted. Amends D-009/D-018, D-020/D-024 and clarifies D-019/D-023.
+
+**Context:** The correction review found that the startup sequence used environment variables as
+bidirectional IPC after spawn, execution status considered only attempted sections, new run tables
+lacked ownership/uniqueness rules, and Sprint 1 sign-off did not depend on its packaged-build spike.
+
+**Decision:**
+- Use private inherited pipes/handles for the full startup exchange. Environment variables may
+  configure a process at spawn but cannot return its port or deliver a post-start session token.
+  The child binds port 0, reports its endpoint privately, answers a fresh endpoint challenge, then
+  receives the session token privately and acknowledges readiness. Only then may Tauri release
+  the endpoint/token to the frontend. Define the challenge as a domain-separated HMAC-SHA-256 of a
+  fresh nonce and bound endpoint using the startup secret; reject replay/mismatched responses.
+  The challenge endpoint is the sole pre-authentication protocol exception: no evidence or session
+  secret is accepted there. All failures, including readiness timeout, fail closed. This replaces
+  D-009's environment-variable delivery for the supervised FastAPI startup flow.
+- Persist coordinator-owned run lifecycle. Each run belongs to one artifact and atomically
+  snapshots its nonempty intended section set as pending result rows. Membership and section
+  content remain immutable for that run. Only completion of every intended section can yield
+  success; partial completion, cancellation and interruption follow `COMPLIANCE_MODEL.md`'s
+  rules. Store sanitized run-level stop reasons; preserve unattempted rows after stops.
+- Enforce unique (run, section) rows and same-artifact section ownership. A superseding run must
+  belong to the same artifact, have a permitted completed outcome, and neither reference itself
+  nor create a cycle; validate the replacement chain inside the write transaction.
+- S1-08 depends on S1-09 and records its actual clean-machine result. A failed spike remains a
+  blocker with a mitigation plan and explicit owner go/no-go decision, never a claimed pass.
+- Both model roles declare input limits. Embedding normalization and similarity metric are
+  separate fields and part of embedding configuration identity. Authenticated loopback IPC is
+  permitted during inference; external network calls remain prohibited.
+
+**Required implementation acceptance cases:**
+- S1-04/S1-09: exchange the bound port and post-start token over private handles; verify correct
+  startup, wrong/replayed challenge, child exit, readiness timeout, and missing/wrong session
+  credential. No endpoint/token reaches the frontend before acknowledgement. Test a fake endpoint
+  explicitly rather than assuming port 0 selects a particular preoccupied port.
+- Sprint 8: one successful section plus nine pending sections must never yield success; test zero
+  mappings after full success, all failures, startup failure, cancellation after partial work,
+  restart interruption, and queued work with no results. Verify intended rows survive each stop.
+- Sprint 8: reject duplicate/cross-artifact section results, cross-artifact replacement,
+  self-replacement and cycles; accept a valid same-artifact completed replacement. Retain the
+  older approval behavior defined in D-021.
+- Sprint 1: exit sign-off includes the packaged-build result; a dev-only pass is insufficient.
+
+**Consequences:** Documentation and proposed schema only. No application code, new dependencies,
+or migration is introduced. Earlier ADR history remains historical where explicitly superseded;
+the amended subsystem docs and this contract govern implementation.
 
 ---
 

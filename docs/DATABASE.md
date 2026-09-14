@@ -90,6 +90,7 @@ erDiagram
         string id PK
         string artifact_id FK
         string status "queued|running|succeeded|partially_succeeded|failed|cancelled|interrupted"
+        string stop_reason "nullable, sanitized run-level stop category"
         string superseded_by_analysis_run_id FK "nullable, self-referencing"
         string model_provider
         string model_identifier
@@ -100,6 +101,7 @@ erDiagram
         string embedding_model_digest
         int embedding_dimensions
         string embedding_normalization
+        string embedding_similarity_metric
         string embedding_config_version
         string framework_id FK
         string framework_version
@@ -114,7 +116,7 @@ erDiagram
         string id PK
         string analysis_run_id FK
         string artifact_section_id FK
-        string outcome "no_candidates_retrieved|evaluated_no_mappings|evaluated_with_mappings|failed"
+        string outcome "pending|running|no_candidates_retrieved|evaluated_no_mappings|evaluated_with_mappings|failed"
         string failure_category "nullable, sanitized"
         int attempt_count
         datetime started_at
@@ -188,7 +190,10 @@ initial upload filter).
 One row per analysis attempt against an artifact (`COMPLIANCE_MODEL.md` "AnalysisRun",
 `DECISIONS.md` D-012/D-013, revised by D-020/D-021/D-023). `status` is a pure execution-progress
 value — `queued` / `running` / `succeeded` / `partially_succeeded` / `failed` / `cancelled` /
-`interrupted` — derived from `analysis_run_section_result` rows, never asserted directly.
+`interrupted` — persisted coordinator state (D-025). Creation atomically inserts the queued run
+and a `pending` section-result row for every intended section; the set is nonempty and immutable.
+Completion is calculated against that full set. `stop_reason` records sanitized run-level failures
+or stop events; queued/running/cancelled/interrupted cannot be inferred from terminal section results.
 `superseded_by_analysis_run_id` is a **separate**, nullable self-referencing FK recording an
 explicit replacement relationship; it is never inferred from a rerun simply having started, and a
 `failed`/`cancelled` replacement must never populate it on the prior run. Carries the immutable
@@ -202,11 +207,16 @@ supersession, and still count toward current coverage unless an analyst explicit
 
 ### analysis_run_section_result
 One row per (`analysis_run_id`, `artifact_section_id`) recording that section's own evaluation
-outcome within the run (`DECISIONS.md` D-020): `no_candidates_retrieved` / `evaluated_no_mappings` /
-`evaluated_with_mappings` / `failed`, a sanitized `failure_category` (no evidence content —
-`SECURITY.md` T-10) where applicable, `attempt_count`, and timing. `analysis_run.status` is computed
-from these rows, not stored independently of them — this is what prevents a run with many failed
-sections and one trivially successful one from reporting as blanket "succeeded."
+outcome within the run (D-020/D-025): `pending` / `running` / `no_candidates_retrieved` /
+`evaluated_no_mappings` / `evaluated_with_mappings` / `failed`, a sanitized `failure_category`,
+`attempt_count`, and timing. Rows are created for all intended sections before work starts, not
+only for attempted sections. Their section IDs/content remain immutable for the run; re-chunking
+creates new section rows without replacing historical citations. The coordinator persists run
+transitions in transactions using these results and explicit lifecycle events, following
+`COMPLIANCE_MODEL.md`'s completion rules. Candidate writes and their completed section result must
+commit together; unfinished rows remain visible after a stop. A run cannot succeed while any
+intended row is pending/running/failed. Explicit cancellation/interruption takes precedence over
+success-count aggregation; queued runs remain queued until started or cancelled.
 
 ### artifact_section
 `locator` is a human-meaningful pointer back into the source document (e.g. page number, heading
@@ -285,8 +295,12 @@ set couldn't distinguish these outcomes):
   superseded ones, is a core provenance/audit query.
 - `analysis_run.superseded_by_analysis_run_id`: indexed; nullable self-referencing FK, set only by
   an explicit action (`DECISIONS.md` D-021), never implied by a rerun merely starting.
-- `analysis_run_section_result.analysis_run_id` + `.artifact_section_id`: indexed; `analysis_run_id`
-  is the primary lookup for "compute this run's overall status from its section outcomes."
+- `analysis_run_section_result`: unique index on (`analysis_run_id`, `artifact_section_id`);
+  each section belongs to the run's artifact. The rows snapshot all intended work at run creation.
+- `analysis_run.superseded_by_analysis_run_id`: when set, references a completed replacement for
+  the same artifact, never itself; cycles are rejected by walking the replacement chain inside the
+  write transaction. Only `succeeded` or explicitly selected `partially_succeeded` replacements
+  are allowed. These are separately enforced invariants, not properties of a plain self-FK.
 - `analyst_decision`: unique index on (`mapping_candidate_id`, `revision`); current status is the
   row with the max `revision` per candidate, not the max `decided_at` (`DECISIONS.md` D-024).
   Writes should be guarded by an expected-revision check (optimistic concurrency) at the application

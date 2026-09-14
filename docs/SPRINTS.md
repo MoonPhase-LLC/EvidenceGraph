@@ -258,7 +258,7 @@ quality before the rest of the review/graph/gap features are built on top of thi
 surfacing the Coverage Signals from `COMPLIANCE_MODEL.md` — not a computed sufficiency verdict).
 
 **Codex responsibilities:** Retrieval implementation, LLM evaluation orchestration, schema
-validation, per-section outcome persistence and run-status derivation (`DECISIONS.md` D-020),
+validation, intended-section snapshot persistence and coordinator lifecycle transitions (D-025),
 provenance persistence, adversarial testing (prompt injection test fixtures), running the small
 evaluation sample and reporting baseline retrieval/mapping quality.
 
@@ -277,7 +277,9 @@ beyond producing an (still-human-reviewed) mapping candidate; two concurrent Ana
 on the same candidate are resolved deterministically via revision, not by wall-clock race
 (`DECISIONS.md` D-024); the small evaluation sample shows retrieval/mapping quality is not obviously
 broken (not a formal precision/recall gate — that's Sprint 14) before later sprints build on this
-pipeline.
+pipeline. D-025's run lifecycle and integrity acceptance cases are required: unattempted sections
+cannot yield success; cancellation/interruption remain distinguishable; duplicate/cross-artifact
+section results, self-replacement and replacement cycles are rejected transactionally.
 
 ---
 

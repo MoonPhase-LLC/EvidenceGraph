@@ -32,9 +32,9 @@ V0.1 ships exactly one provider implementation: `LlamaCppProvider`. The interfac
 `OllamaProvider`, `VLLMProvider`, or an `EnterprisePrivateProvider` could be added later without
 touching pipeline code — not because V0.1 needs more than one.
 
-`ModelProvider` implementations must never make network calls as part of `generate`/`embed`
-(inference itself is always local); network calls are confined to the separate model
-download/catalog flow (§5).
+`ModelProvider` implementations must never make external network calls as part of `generate`/`embed`.
+Authenticated loopback IPC is permitted; external calls are confined to the explicit model
+download/catalog flow (§3, §6).
 
 ## 2. `LlamaCppProvider`
 
@@ -74,9 +74,12 @@ A manifest describing available/recommended models, e.g. (size in bytes, four an
 
 `roles` (`DECISIONS.md` D-023) declares which capability/capabilities a catalog entry supports:
 `["generation"]`, `["embedding"]`, or both. Capability-specific fields apply only to the relevant
-role(s) — `context_window` is a generation concern; an embedding-role entry instead carries
-`embedding_dimensions` and `embedding_normalization` (e.g. `"cosine"`/`"l2"`) so the app knows how
-to use its output without guessing.
+role(s). Both roles require an explicit maximum input-token limit and tokenizer identity;
+generation additionally budgets output tokens within its `context_window`. Embedding inputs must
+be chunked within their model's limit, never silently truncated. Embedding entries also carry
+`embedding_dimensions`, `embedding_normalization` (e.g. `"none"` or `"l2"`), and
+`embedding_similarity_metric` (e.g. `"cosine"` or `"dot_product"`). Normalization transforms a
+vector; a similarity metric compares vectors. They are separate configuration fields (D-025).
 
 The catalog is data (a manifest file, versioned with the app or fetched from a pinned source —
 exact hosting TBD), not hardcoded model-selection logic. This is what lets recommendations be
@@ -188,8 +191,8 @@ from the D-009 frontend↔FastAPI session token:
   credential; requests without it are rejected before any processing. A pure liveness-only health
   endpoint may be explicitly exempted if the runtime distinguishes one from inference-capable
   endpoints — document which endpoints are exempt, don't assume.
-- The credential is passed to the child the same way as the D-009 token (environment variable
-  scoped to that child process, or an equivalent inherited-handle mechanism) — never a CLI argument,
+- The credential is passed to the child at spawn in a child-scoped environment variable, or through
+  a private inherited handle supported by the runtime — never a CLI argument,
   never logged (`SECURITY.md` T-10).
 - If llama.cpp's server mode has no native per-request auth, FastAPI fronts it with a thin
   authenticating wrapper in the same process boundary so that no unauthenticated path to the model
@@ -201,7 +204,8 @@ on its own — see `SECURITY.md` T-23.
 ## 11. Offline Mode
 
 Once a model is downloaded/imported and verified, all `ModelProvider` operations (`generate`,
-`embed`, `health_check`) must function with no network access. Only §6 (download) and catalog
+`embed`, `health_check`) must function with external network access blocked; authenticated loopback
+IPC remains permitted. Only §6 (download) and catalog
 browsing require network access, and both are clearly distinguished in the UI from
 fully-offline-capable actions per `ARCHITECTURE.md` §11.
 

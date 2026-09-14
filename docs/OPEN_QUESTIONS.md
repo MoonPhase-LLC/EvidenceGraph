@@ -63,10 +63,10 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
 
 ## Architecture
 
-- A-1: Exact mechanism for Tauri↔FastAPI local port allocation (fixed default vs. dynamically
-  chosen and passed to the frontend at startup)? To be resolved concretely in Sprint 1 ticket
-  S1-04, but the general approach should have product-owner visibility given it's a security-
-  adjacent decision (`ARCHITECTURE.md` §4, §13).
+- A-1: **Resolved by D-018/D-025:** the child binds loopback port 0 and reports the bound port over
+  private inherited pipes/handles. Startup verifies the endpoint before delivering the session
+  token over that channel and releasing it to the frontend. S1-04/S1-09 validate the Windows
+  implementation; fixed-vs-dynamic allocation and environment-variable IPC are no longer open.
 - A-2: Where are models and the SQLite database stored on disk, and is either path
   user-configurable? (`USER_FLOWS.md` §3, §12)
 - A-3: What is the packaging strategy for bundling the Python runtime inside the Tauri app for

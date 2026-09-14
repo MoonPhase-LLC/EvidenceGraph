@@ -112,21 +112,23 @@ is calling.
 - Tauri launches the FastAPI service as a local child process on app start and terminates it on
   app exit.
 - Frontend communicates with the service over HTTP restricted to `127.0.0.1` on a locally
-  allocated port (not a fixed well-known port, to reduce collision/hijack risk — open question,
-  see `DECISIONS.md`).
+  allocated port, bound atomically by the child using port 0 (D-018/D-025).
 - Localhost binding restricts *network* reachability but is not authentication (`SECURITY.md`
   T-09): the Tauri host generates a random shared-secret token at each app launch, passes it to the
-  FastAPI child process via environment variable and to the frontend via Tauri's own IPC channel,
+  verified FastAPI child through private inherited pipes/handles and to the frontend via Tauri IPC,
   and every local-service request must carry that token (`DECISIONS.md` D-009). This is a
   lightweight, session-scoped mechanism — not a user login/credential system.
 - A token alone doesn't prove the *service* is legitimate, so startup additionally runs a
   fail-closed identity-verification handshake before any token or evidence is exposed to the
   frontend (`DECISIONS.md` D-018): Tauri launches its own bundled service executable and passes a
-  one-time startup secret via a private inherited channel; the child binds an OS-assigned loopback
+  one-time startup secret via private inherited pipes/handles supporting both directions; the child
+  binds an OS-assigned loopback
   port (port 0) and reports it back over that same private channel; Tauri then issues a challenge
   over the resulting HTTP endpoint and verifies the response against the startup secret, without
-  ever sending that secret over HTTP; only on success does Tauri expose the endpoint and the D-009
-  session token to the frontend. Any failure (child exit, bind failure, timeout, bad challenge
+  ever sending that secret over HTTP. After verification, Tauri sends the session token through
+  the private channel and waits for the child's authentication-ready acknowledgement before
+  exposing the endpoint/token to the frontend (D-025). Environment variables cannot provide this
+  bidirectional exchange. Any failure (child exit, bind failure, timeout, bad challenge
   response) fails closed — no fallback to whatever else may be listening on a port.
 - The model runtime (llama.cpp) has its **own** independent credential, separate from the D-009
   token, held only within the FastAPI process boundary and never exposed to the frontend
@@ -231,5 +233,5 @@ SQLite/SQLAlchemy, llama.cpp/GGUF) is accepted for V0.1 with the following notes
 - **No graph database, no message queue, no Kubernetes, no microservices**: correct call for this
   scope; see `DECISIONS.md` D-002.
 
-Open architectural question flagged, not resolved here: exact mechanism for Tauri↔FastAPI process
-supervision and port allocation. See `docs/OPEN_QUESTIONS.md`.
+Port allocation and the startup exchange are defined by D-018/D-025. The concrete Windows
+pipe/handle and process-supervision implementation is validated in S1-04/S1-09.

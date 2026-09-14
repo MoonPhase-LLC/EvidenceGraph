@@ -157,27 +157,29 @@ threshold exists in V0.1. See `COMPLIANCE_MODEL.md` §4.
 
 Every analysis attempt against an artifact is tracked as an `AnalysisRun`
 (`COMPLIANCE_MODEL.md` "AnalysisRun", `DECISIONS.md` D-012, revised by D-020). Its `status` is a
-pure execution-progress value — `queued` / `running` / `succeeded` / `partially_succeeded` /
-`failed` / `cancelled` / `interrupted` — **derived from persisted per-section outcomes**
-(`AnalysisRunSectionResult`: `no_candidates_retrieved` / `evaluated_no_mappings` /
-`evaluated_with_mappings` / `failed` per artifact section), never asserted at the run level
-directly. This is what lets the failure modes below be distinguished from "never analyzed," from
-each other, and — critically — from a run that only *partially* completed, rather than a
-few-failures-among-many-successes run silently reporting as blanket "succeeded."
+persisted coordinator lifecycle value — `queued` / `running` / `succeeded` / `partially_succeeded` /
+`failed` / `cancelled` / `interrupted` (D-025). Run creation atomically snapshots every intended
+section as a `pending` `AnalysisRunSectionResult`; work changes outcomes to `running`, then
+`no_candidates_retrieved` / `evaluated_no_mappings` / `evaluated_with_mappings` / `failed`.
+Completion is calculated over the full intended set, never only attempted sections. Cancellation,
+interruption, and startup failure are persisted lifecycle events with a sanitized `stop_reason`.
+The coordinator commits state transitions transactionally; candidate writes and the corresponding
+completed section result commit together. Queued work remains queued until started or cancelled.
 
 Failure modes and required behavior — must never fail silently or fall back to a remote provider:
 
 - **Model unavailable / not running**: surface a clear error in the UI; do not queue silently
   forever without status; do not fall back to any cloud provider (`CLAUDE.md`/`AGENT_INSTRUCTIONS.md`
   hard rule). If this happens before any section is processed, the `AnalysisRun` is `failed`; if it
-  happens mid-run after some sections already completed, those sections' results are preserved and
-  the run is `partially_succeeded`, not retroactively `failed`.
+  happens mid-run, preserve results and unattempted section rows. The run is `partially_succeeded`
+  if any section succeeded, otherwise `failed`; record the sanitized run-level failure reason.
 - **Model returns malformed output**: retry once with the same input; on second failure, record
   that section's `AnalysisRunSectionResult` as `failed` with a sanitized failure category (no
   evidence content — `SECURITY.md` T-10) and move on — one failed section must not abort analysis
-  of the rest of the artifact. The run's overall status is computed from all sections' outcomes once
-  the run completes (`succeeded` if none failed, `partially_succeeded` if some did and some didn't,
-  `failed` if all did).
+  of the rest of the artifact. At normal completion, persist `succeeded` only if every intended
+  section has a successful terminal outcome. A non-cancellation/non-interruption stop with some
+  successful rows and any failed or unfinished rows is `partially_succeeded`; with no successful
+  rows it is `failed`.
 - **Model times out**: bounded timeout per evaluation call (value TBD); record as a `failed`
   section outcome per above.
 - **Retrieval finds zero candidate controls for a section**: valid outcome, not an error; recorded
@@ -193,6 +195,8 @@ Failure modes and required behavior — must never fail silently or fall back to
 - **App/process terminated mid-run**: an `AnalysisRun` left in `running` state across a restart is
   detected and relabeled `interrupted` rather than left ambiguously "running" forever or silently
   reported as a terminal state it never reached.
+- **Explicit cancellation**: persist `cancelled` and a sanitized stop reason; preserve completed
+  results and unattempted rows. Cancellation/interruption takes precedence over result aggregation.
 - **Re-running analysis on an already-analyzed artifact**: creates a new `AnalysisRun`. Supersession
   of the prior run is a **separate, explicit** action (`analysis_run.superseded_by_analysis_run_id`,
   `DECISIONS.md` D-021) — it is never implied merely by starting a rerun, and a `failed` or

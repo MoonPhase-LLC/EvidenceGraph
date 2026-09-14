@@ -85,17 +85,19 @@ This keeps the V0.1 pipeline to one level of extraction (document → sections) 
 (document → statements → controls).
 
 ### AnalysisRun **[V0.1]**
-One row per analysis attempt (a run of the pipeline against an artifact, or a batch of artifacts
-analyzed together). Exists so the system can distinguish states the original model could not
+One row per analysis attempt against one artifact. A batch operation creates independent runs for
+its artifacts. Exists so the system can distinguish states the original model could not
 represent: an artifact that was **never analyzed** (no `AnalysisRun` exists), and — for one that
 was — its execution progress. `status` is a pure execution-progress value: `queued` / `running` /
 `succeeded` / `partially_succeeded` / `failed` / `cancelled` / `interrupted`
 (`DECISIONS.md` D-020). "Produced zero mappings" is a fact about *output*, not execution status — a
 `succeeded` run can produce zero Mapping Candidates (a legitimate, non-error outcome — see
 `AI_PIPELINE.md` §11); a `partially_succeeded` run can also produce zero. Execution status is
-derived from **persisted per-section outcomes** (`AnalysisRunSectionResult`, below), not asserted
-directly, so a run with many failed sections and one trivially successful one is visibly
-`partially_succeeded`, never indistinguishable from a run that examined everything successfully.
+persisted and updated transactionally by the coordinator (D-025). At creation, the run snapshots
+its complete intended section set as `AnalysisRunSectionResult` rows with `pending` outcomes.
+Section membership and cited section content are immutable for that run. Completion is calculated
+against this entire set, not just the sections attempted; lifecycle events such as cancellation,
+startup failure, and interruption are recorded at run level rather than inferred from results.
 
 Also the anchor point for immutable analysis-configuration identity (see §5) — this is what makes
 "which model/framework/prompt version actually produced this mapping" answerable rather than
@@ -110,13 +112,18 @@ results). The default V0.1 policy for a `partially_succeeded` replacement is tha
 automatically supersede a prior complete run either — an explicit action is required.
 
 ### AnalysisRunSectionResult **[V0.1]**
-One row per (`AnalysisRun`, Artifact Section) recording that section's own evaluation outcome:
-`no_candidates_retrieved` / `evaluated_no_mappings` / `evaluated_with_mappings` / `failed`, plus a
-sanitized failure category where applicable (no evidence content — `SECURITY.md` T-10), attempt
-count, and timestamps. `AnalysisRun.status` (above) is derived from these: `succeeded` if every
-attempted section reached a non-`failed` outcome, `partially_succeeded` if some succeeded and some
-failed, `failed` if every attempted section failed (or a fatal error occurred before any section was
-processed). See `DECISIONS.md` D-020.
+One row per intended (`AnalysisRun`, Artifact Section), created before work starts, with outcome:
+`pending` / `running` / `no_candidates_retrieved` / `evaluated_no_mappings` /
+`evaluated_with_mappings` / `failed`; sanitized failure category, attempt count, and timestamps.
+The three `no_candidates_retrieved`/`evaluated_*` outcomes are successful terminal outcomes.
+The coordinator persists `succeeded` only when every intended section has one of those outcomes.
+On a non-cancellation/non-interruption stop, some successful sections plus failed or unfinished
+sections produce `partially_succeeded`; no successful sections produce `failed`. Persist a sanitized
+run-level stop reason so unattempted sections are not mistaken for successful evaluations.
+Explicit cancellation produces `cancelled`; an unfinished `running` run found after restart becomes
+`interrupted`, even if some sections succeeded. Retain section results in both cases. A queued run
+remains queued until explicitly started or cancelled. Empty section sets are rejected before run
+creation (unusable extraction is reported on the artifact). See D-020 as amended by D-025.
 
 ### Mapping Candidate **[V0.1]**
 A suggestion of a relationship between an Artifact Section (or Policy Statement, once that entity
@@ -165,7 +172,7 @@ verdict:
 | Support present | ≥1 current, approved `SUPPORTS` mapping. |
 | Partial support present | ≥1 current, approved `PARTIALLY_SUPPORTS` mapping. |
 | Confirmed conflict | ≥1 current, approved `CONFLICTS_WITH` mapping. |
-| References only | ≥1 current, approved `REFERENCES` mapping, and neither signal above is true. |
+| References only | ≥1 current, approved `REFERENCES` mapping, with no Support present, Partial support present, or Confirmed conflict signal. |
 | Review pending | ≥1 relevant Mapping Candidate is still `needs_review`. |
 | Analysis incomplete | Relevant analysis failed, is pending, or only partially completed (`DECISIONS.md` D-020) — means "don't trust an apparent absence of evidence yet," not "no evidence." |
 
@@ -308,8 +315,9 @@ Mapping Candidate row):
   generation-model weights, from the model catalog manifest's `sha256` where available —
   `MODEL_RUNTIME.md` §6)
 - `embedding_model_identifier` + `embedding_model_version` + `embedding_model_digest`, plus
-  `embedding_dimensions`, `embedding_normalization`, and `embedding_config_version` (a digest
-  covering model + preprocessing + normalization) — recorded **separately** from the generation
+  `embedding_dimensions`, `embedding_normalization`, `embedding_similarity_metric`, and
+  `embedding_config_version` (a digest covering model + preprocessing + normalization + metric) —
+  recorded **separately** from the generation
   model's identity, since they may be different models entirely (`DECISIONS.md` D-023). A change in
   embedding configuration invalidates any previously built embedding index for retrieval; vectors
   from different configurations must never be compared.
@@ -318,8 +326,9 @@ Mapping Candidate row):
 - `prompt_template_version`
 - relevant non-default inference settings actually used
 - `status` (`queued` / `running` / `succeeded` / `partially_succeeded` / `failed` / `cancelled` /
-  `interrupted` — a pure execution-progress value, derived from persisted per-section outcomes, not
-  asserted directly; see "AnalysisRunSectionResult" above and `DECISIONS.md` D-020)
+  `interrupted` — persisted coordinator lifecycle state, with completion calculated against all
+  intended section rows; see "AnalysisRunSectionResult" above and D-025)
+- `stop_reason` (nullable sanitized run-level failure/stop category, never evidence content)
 - `superseded_by_analysis_run_id` (nullable, self-referencing — a separate supersession
   relationship, not a status value; set only when a later run is explicitly meant to replace this
   one for current-coverage purposes; `DECISIONS.md` D-021)
@@ -379,6 +388,10 @@ application-layer checks otherwise (see `DATABASE.md` §5 for the concrete const
    4. `Assessment Scope` entries belong to the assessment's own framework.
    5. (Mapping Candidate, Artifact Section) citation pairs are unique — no duplicate citation of the
       same section by the same candidate.
+   6. A section-result row belongs to the same artifact as its run; (run, section) pairs are unique.
+   7. A superseding run belongs to the same artifact. Self-references and cycles are rejected in
+      the transaction that records replacement; only a completed `succeeded` or explicitly selected
+      `partially_succeeded` run may replace another run (D-021/D-025).
 5. These invariants exist specifically so that adding a second framework or running concurrent
    assessments never risks one client's evidence, mappings, or framework context leaking into
    another's — the single most consequential failure mode for a multi-client compliance tool, even
