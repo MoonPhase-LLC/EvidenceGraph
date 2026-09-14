@@ -87,14 +87,36 @@ This keeps the V0.1 pipeline to one level of extraction (document → sections) 
 ### AnalysisRun **[V0.1]**
 One row per analysis attempt (a run of the pipeline against an artifact, or a batch of artifacts
 analyzed together). Exists so the system can distinguish states the original model could not
-represent: an artifact that was **never analyzed**, one where analysis **succeeded but produced no
-mappings** (a valid, non-error outcome — see `AI_PIPELINE.md` §11), one where analysis **failed**
-(model unavailable, validation failures on every candidate, etc.), and one whose mappings have been
-**superseded** by a later run (e.g. after a model upgrade or a framework update). Status:
-`succeeded` / `succeeded_no_mappings` / `failed` / `superseded`. Also the anchor point for
-immutable analysis-configuration identity (see §5) — this is what makes "which model/framework/
-prompt version actually produced this mapping" answerable rather than duplicated loosely across
-every Mapping Candidate row. See `DECISIONS.md` D-012/D-013.
+represent: an artifact that was **never analyzed** (no `AnalysisRun` exists), and — for one that
+was — its execution progress. `status` is a pure execution-progress value: `queued` / `running` /
+`succeeded` / `partially_succeeded` / `failed` / `cancelled` / `interrupted`
+(`DECISIONS.md` D-020). "Produced zero mappings" is a fact about *output*, not execution status — a
+`succeeded` run can produce zero Mapping Candidates (a legitimate, non-error outcome — see
+`AI_PIPELINE.md` §11); a `partially_succeeded` run can also produce zero. Execution status is
+derived from **persisted per-section outcomes** (`AnalysisRunSectionResult`, below), not asserted
+directly, so a run with many failed sections and one trivially successful one is visibly
+`partially_succeeded`, never indistinguishable from a run that examined everything successfully.
+
+Also the anchor point for immutable analysis-configuration identity (see §5) — this is what makes
+"which model/framework/prompt version actually produced this mapping" answerable rather than
+duplicated loosely across every Mapping Candidate row. See `DECISIONS.md` D-012/D-013.
+
+**Supersession is separate from execution status** (`DECISIONS.md` D-021): an `AnalysisRun` never
+has its own execution outcome rewritten after completion. Instead, `superseded_by_analysis_run_id`
+(nullable, self-referencing) is set explicitly when a later run is meant to replace an earlier one
+for current-coverage purposes — never automatically just because a rerun was *started*, and never
+set by a **failed or cancelled** replacement (a broken rerun must not erase previously-good
+results). The default V0.1 policy for a `partially_succeeded` replacement is that it does **not**
+automatically supersede a prior complete run either — an explicit action is required.
+
+### AnalysisRunSectionResult **[V0.1]**
+One row per (`AnalysisRun`, Artifact Section) recording that section's own evaluation outcome:
+`no_candidates_retrieved` / `evaluated_no_mappings` / `evaluated_with_mappings` / `failed`, plus a
+sanitized failure category where applicable (no evidence content — `SECURITY.md` T-10), attempt
+count, and timestamps. `AnalysisRun.status` (above) is derived from these: `succeeded` if every
+attempted section reached a non-`failed` outcome, `partially_succeeded` if some succeeded and some
+failed, `failed` if every attempted section failed (or a fatal error occurred before any section was
+processed). See `DECISIONS.md` D-020.
 
 ### Mapping Candidate **[V0.1]**
 A suggestion of a relationship between an Artifact Section (or Policy Statement, once that entity
@@ -111,48 +133,72 @@ recent Analyst Decision is `approved`. See Decision D-005 in `DECISIONS.md` for 
 separate table.
 
 ### Analyst Decision **[V0.1]**
-A human decision on a Mapping Candidate: `approved`, `rejected`, or `needs_review`, with a
-timestamp and (V0.1, single-user) the local user identity. Multiple decisions can exist over time
-for the same candidate (e.g. reopened after `needs_review`); the current status is the latest
-decision. Decisions are **deterministically append-only**: a decision row is never updated or
-deleted, only superseded by a newer row with a later `decided_at` for the same
-`mapping_candidate_id`; "current status" is always a derived read (latest row per candidate), never
-a mutated field. This is the audit-trail guarantee `PRODUCT.md` §4/§8 and `COMPLIANCE_MODEL.md` §4
-depend on.
+A human decision on a Mapping Candidate: `approved`, `rejected`, or `needs_review`. Multiple
+decisions can exist over time for the same candidate (e.g. reopened after `needs_review`).
+Decisions are **deterministically append-only**: a decision row is never updated or deleted, only
+superseded by a newer row. Ordering is by an explicit, monotonically increasing per-candidate
+`revision` integer assigned inside the write transaction — **not** by `decided_at` wall-clock time,
+which can collide or move backward across clock changes (`DECISIONS.md` D-024). "Current status" is
+always a derived read (highest-`revision` row per candidate), never a mutated field. `decided_at` is
+retained as descriptive audit metadata only. A write must state the revision it expects to extend
+(optimistic concurrency); a write against a stale expected-revision is rejected rather than
+silently clobbering a concurrent decision. `decided_by` is a stable **local, unverified** identity
+in V0.1 (single-user, no authentication of who is physically at the keyboard) — never presented as
+a verified signature in any UI or export. This is the audit-trail guarantee `PRODUCT.md` §4/§8 and
+§4 below depend on.
 
-An Analyst Decision of `approved` records agreement with the mapping's `relationship_type` — it is
-**not** the same thing as a judgment that the evidence is *sufficient* for the control (see
-"Evidence Sufficiency" below); those are kept as separate concepts even though V0.1's UI may
-surface them together.
+An Analyst Decision of `approved` records agreement with the mapping's `relationship_type` for
+*that one candidate* — it is **not** a judgment that the control as a whole is adequately
+addressed. V0.1 makes no such holistic judgment automatically; see "Coverage Signals" below.
 
-### Evidence Sufficiency **[V0.1, distinct concept — not a new persisted field beyond what's needed for the gap view]**
-Whether a control's *approved coverage*, taken as a whole, is enough to consider the control
-addressed. This is explicitly **not** the same thing as any single Mapping Candidate's
-`relationship_type` or `confidence`, and not the same thing as an Analyst Decision on one candidate:
-a control could have one `approved` `PARTIALLY_SUPPORTS` mapping (an analyst-confirmed relationship
-that is still, by its own type, incomplete) — the relationship type and confidence describe *that
-one candidate*; sufficiency is a judgment about the control's *overall* coverage across all of its
-approved mappings. V0.1 computes sufficiency the same way it computes gaps (§"Finding / Gap"
-below): a control is "sufficiently covered" if it has at least one `approved` `SUPPORTS` mapping,
-"partially covered" if its approved mappings are `PARTIALLY_SUPPORTS`-only, and "not covered"
-otherwise. This is a computed view, not an analyst-editable field, in V0.1 — see
-`OPEN_QUESTIONS.md` if a future sprint needs an explicit analyst override of the computed
-sufficiency judgment.
+### Coverage Signals **[V0.1, computed — replaces an earlier "Evidence Sufficiency" auto-judgment]**
+An earlier design computed an automatic "sufficiently covered" / "partially covered" / "not
+covered" verdict per control from one approved mapping. A second-round architectural review
+correctly identified that as an unreviewed automatic judgment the product's own principles forbid
+(`PRODUCT.md` principle 3, §4 below: only a human decision is authoritative), and one that silently
+treated partial-only evidence as fully resolved. V0.1 instead reports independent, simultaneously-
+possible factual signals per control (`DECISIONS.md` D-019), none of which is itself a sufficiency
+verdict:
+
+| Signal | Meaning |
+|---|---|
+| Support present | ≥1 current, approved `SUPPORTS` mapping. |
+| Partial support present | ≥1 current, approved `PARTIALLY_SUPPORTS` mapping. |
+| Confirmed conflict | ≥1 current, approved `CONFLICTS_WITH` mapping. |
+| References only | ≥1 current, approved `REFERENCES` mapping, and neither signal above is true. |
+| Review pending | ≥1 relevant Mapping Candidate is still `needs_review`. |
+| Analysis incomplete | Relevant analysis failed, is pending, or only partially completed (`DECISIONS.md` D-020) — means "don't trust an apparent absence of evidence yet," not "no evidence." |
+
+These coexist — a control can show both "Support present" and "Confirmed conflict," and the UI
+must show both, not collapse them into one verdict. If a future feature needs a genuine holistic
+"this control is adequately addressed" determination, it must be an explicit, rationale-carrying
+human decision with its own history, never a computed default (see `OPEN_QUESTIONS.md` U-7).
 
 ### Finding / Gap **[V0.1, computed — not a persisted AI output; renamed for clarity below]**
-A control (in an assessment's scope, see "Assessment Scope" above) with no `approved` `SUPPORTS`/
-`PARTIALLY_SUPPORTS` mapping. Computed from existing data at query time in V0.1 rather than stored
-as its own AI-generated artifact — this avoids a second class of "AI assertion" needing its own
-provenance and review lifecycle in V0.1. See `DECISIONS.md` D-006.
+A control (in an assessment's scope, see "Assessment Scope" above) **without** the "Support
+present" coverage signal (i.e., no current, approved `SUPPORTS` mapping — see "Coverage Signals"
+above). Computed from existing data at query time in V0.1 rather than stored as its own
+AI-generated artifact — this avoids a second class of "AI assertion" needing its own provenance and
+review lifecycle in V0.1. See `DECISIONS.md` D-006.
 
-**Coverage semantics (important, and previously under-specified — `DECISIONS.md` D-014):** only
-`approved` mappings with `relationship_type` `SUPPORTS` or `PARTIALLY_SUPPORTS` count toward
-coverage. An `approved` `CONFLICTS_WITH` mapping never satisfies coverage — it is a confirmed
-conflict, which is a *different* signal surfaced alongside the gap view, not a substitute for it. An
-`approved` `REFERENCES` mapping also never satisfies coverage — the analyst confirmed the evidence
-mentions the topic, not that it demonstrates implementation. A control with only approved
-`CONFLICTS_WITH`/`REFERENCES` mappings (and no approved `SUPPORTS`/`PARTIALLY_SUPPORTS`) is still a
-gap.
+**Coverage semantics (important, and refined twice — `DECISIONS.md` D-014, then D-019):** only an
+`approved` `SUPPORTS` mapping satisfies "Support present" and removes a control from the gap view.
+An `approved` `PARTIALLY_SUPPORTS` mapping is its own distinct "Partial support present" signal and
+**stays visible in the gap/coverage-gap view** as unresolved — D-014's original wording treated
+`PARTIALLY_SUPPORTS` as full coverage; D-019 corrected this, since partial-only evidence being
+silently treated as "resolved" would hide genuinely incomplete coverage. An `approved`
+`CONFLICTS_WITH` mapping never satisfies coverage — it is a confirmed conflict, a *different* signal
+surfaced alongside the gap view, not a substitute for it. An `approved` `REFERENCES` mapping also
+never satisfies coverage. A control with only approved `CONFLICTS_WITH`/`REFERENCES`/
+`PARTIALLY_SUPPORTS` mappings (and no approved `SUPPORTS`) is still in the gap view.
+
+**Older-analysis handling (`DECISIONS.md` D-021):** a mapping's coverage contribution does not
+depend on whether its originating `AnalysisRun` has since been superseded — an approved mapping from
+a superseded run still counts toward current coverage. The review UI must flag such a mapping as
+based on a superseded analysis run, prompting the analyst to re-confirm, replace, or withdraw it,
+rather than either silently keeping stale coverage forever or silently revoking it. Re-running
+analysis never transfers a prior approval to a newly generated candidate — a new candidate always
+starts `needs_review`, regardless of what an earlier run's analogous suggestion was decided as.
 
 **Derived view vs. future "Finding":** what this document calls "Finding / Gap" in V0.1 is strictly
 an ephemeral, computed query result — it has no id, no lifecycle, and no independent existence
@@ -259,17 +305,29 @@ this replaces duplicating `model_provider`/`model_identifier`/`model_version` on
 Mapping Candidate row):
 
 - `model_provider` + `model_identifier` + `model_version` + `model_digest` (checksum of the loaded
-  weights, from the model catalog manifest's `sha256` where available — `MODEL_RUNTIME.md` §6)
+  generation-model weights, from the model catalog manifest's `sha256` where available —
+  `MODEL_RUNTIME.md` §6)
+- `embedding_model_identifier` + `embedding_model_version` + `embedding_model_digest`, plus
+  `embedding_dimensions`, `embedding_normalization`, and `embedding_config_version` (a digest
+  covering model + preprocessing + normalization) — recorded **separately** from the generation
+  model's identity, since they may be different models entirely (`DECISIONS.md` D-023). A change in
+  embedding configuration invalidates any previously built embedding index for retrieval; vectors
+  from different configurations must never be compared.
 - `framework_id` + `framework_version` used for control resolution during this run
 - `parser_version` and `chunker_version` that produced the sections evaluated
 - `prompt_template_version`
 - relevant non-default inference settings actually used
-- `status` (`succeeded` / `succeeded_no_mappings` / `failed` / `superseded`)
+- `status` (`queued` / `running` / `succeeded` / `partially_succeeded` / `failed` / `cancelled` /
+  `interrupted` — a pure execution-progress value, derived from persisted per-section outcomes, not
+  asserted directly; see "AnalysisRunSectionResult" above and `DECISIONS.md` D-020)
+- `superseded_by_analysis_run_id` (nullable, self-referencing — a separate supersession
+  relationship, not a status value; set only when a later run is explicitly meant to replace this
+  one for current-coverage purposes; `DECISIONS.md` D-021)
 - `started_at` / `completed_at`
 
 This is what makes "why did this mapping look different after we upgraded the model" answerable,
-and what lets the system distinguish "never analyzed" from "analyzed, found nothing" from "analysis
-failed" from "analyzed under a now-superseded configuration" — none of which the original
+and what lets the system distinguish "never analyzed" from "analyzed, partially completed" from
+"analysis failed" from "analyzed under a now-superseded configuration" — none of which the original
 Mapping-Candidate-only provenance model could represent.
 
 ## 6. Framework Genericity Rule
@@ -291,10 +349,10 @@ visibly distinct from official framework text, and must never be described to th
 the NIST standard itself. Not implemented in V0.1's data model beyond reserving this distinction
 conceptually; see `DECISIONS.md`.
 
-## 8. Cross-Assessment and Cross-Framework Isolation Invariants
+## 8. Cross-Assessment, Cross-Framework, and Referential Isolation Invariants
 
 These must hold for every Assessment, enforced by schema constraints where SQLite allows it and by
-application-layer checks otherwise (see `DATABASE.md` for the concrete FK/constraint mechanics):
+application-layer checks otherwise (see `DATABASE.md` §5 for the concrete constraint mechanics):
 
 1. Every `Artifact`, `Artifact Section`, `Mapping Candidate`, and `Analyst Decision` is reachable
    from exactly one `Assessment` via its foreign-key chain. No table represents evidence or
@@ -308,7 +366,20 @@ application-layer checks otherwise (see `DATABASE.md` for the concrete FK/constr
    application-layer validation enforced at write time, not just at read time.
 3. Duplicate detection (`artifact.sha256_hash`) is scoped per-assessment, never global — see
    `DATABASE.md` §5.
-4. These invariants exist specifically so that adding a second framework or running concurrent
+4. **Individual foreign keys do not, by themselves, compose into full isolation** — a direct FK
+   (e.g. `artifact.assessment_id` → `assessment.id`) only prevents referencing a nonexistent/wrong
+   row on *that one edge*; it does not prevent a join-table row from citing something belonging to a
+   different artifact/assessment than the record doing the citing. The following are therefore
+   explicit, separately-enforced requirements, not assumptions (`DECISIONS.md` D-024):
+   1. Every `artifact_section_id` cited via the Mapping Candidate ↔ Artifact Section join belongs to
+      the same `Artifact` as the citing Mapping Candidate.
+   2. For an AI-sourced Mapping Candidate, its `AnalysisRun`'s artifact matches the Mapping
+      Candidate's own artifact.
+   3. A Mapping Candidate's `enhancement_id`, when set, belongs to its own `control_id`.
+   4. `Assessment Scope` entries belong to the assessment's own framework.
+   5. (Mapping Candidate, Artifact Section) citation pairs are unique — no duplicate citation of the
+      same section by the same candidate.
+5. These invariants exist specifically so that adding a second framework or running concurrent
    assessments never risks one client's evidence, mappings, or framework context leaking into
    another's — the single most consequential failure mode for a multi-client compliance tool, even
    though V0.1 is architecturally single-assessment-at-a-time in its UI.

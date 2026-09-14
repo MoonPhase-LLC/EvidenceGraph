@@ -82,11 +82,14 @@ flowchart LR
 Three boundaries matter most:
 
 1. **File ingestion boundary**: every uploaded file is untrusted bytes until parsed by a
-   size-limited, type-verified, contained parser. The containment mechanism (subprocess isolation
-   vs. hard in-process resource limits vs. WASM sandbox) is decided and implemented in Sprint 4, not
-   deferred to later hardening (`DECISIONS.md` D-010) — Sprint 13 then verifies/hardens it
-   adversarially. Extracted text is still treated as *data*, never as instructions, downstream (see
-   `SECURITY.md`).
+   size-limited, type-verified, contained parser. The containment mechanism is decided and
+   implemented in Sprint 4, not deferred to later hardening (`DECISIONS.md` D-010) — Sprint 13 then
+   verifies/hardens it adversarially. Process separation (a subprocess) alone is **not** the
+   requirement — the boundary must restrict the parser worker to read-only access on its own input,
+   write access to a dedicated scratch location only, no database/credential/network access, and
+   enforced memory/CPU/time/archive-size limits (`DECISIONS.md` D-022); the specific mechanism
+   providing these properties is still open (`OPEN_QUESTIONS.md` S-1). Extracted text is still
+   treated as *data*, never as instructions, downstream (see `SECURITY.md`).
 2. **Model output boundary**: LLM output is untrusted/probabilistic. It must pass deterministic
    schema validation before being persisted as a Mapping Candidate. A model that returns malformed
    JSON, an unknown control ID, or an out-of-range confidence is rejected, not "best-effort
@@ -114,9 +117,22 @@ is calling.
 - Localhost binding restricts *network* reachability but is not authentication (`SECURITY.md`
   T-09): the Tauri host generates a random shared-secret token at each app launch, passes it to the
   FastAPI child process via environment variable and to the frontend via Tauri's own IPC channel,
-  and every local-service request must carry that token. This is a lightweight, session-scoped
-  mechanism — not a user login/credential system — sized to close the "any other local process can
-  call the API" gap without adding real auth infrastructure. See `DECISIONS.md` D-009.
+  and every local-service request must carry that token (`DECISIONS.md` D-009). This is a
+  lightweight, session-scoped mechanism — not a user login/credential system.
+- A token alone doesn't prove the *service* is legitimate, so startup additionally runs a
+  fail-closed identity-verification handshake before any token or evidence is exposed to the
+  frontend (`DECISIONS.md` D-018): Tauri launches its own bundled service executable and passes a
+  one-time startup secret via a private inherited channel; the child binds an OS-assigned loopback
+  port (port 0) and reports it back over that same private channel; Tauri then issues a challenge
+  over the resulting HTTP endpoint and verifies the response against the startup secret, without
+  ever sending that secret over HTTP; only on success does Tauri expose the endpoint and the D-009
+  session token to the frontend. Any failure (child exit, bind failure, timeout, bad challenge
+  response) fails closed — no fallback to whatever else may be listening on a port.
+- The model runtime (llama.cpp) has its **own** independent credential, separate from the D-009
+  token, held only within the FastAPI process boundary and never exposed to the frontend
+  (`DECISIONS.md` D-017, `MODEL_RUNTIME.md` §10) — the FastAPI↔frontend boundary and the
+  FastAPI↔model-runtime boundary are each authenticated on their own terms, not one inheriting
+  security from the other.
 - No remote network calls originate from the local analysis service in V0.1 except: (a) model
   catalog fetch/download, which is an explicit, visible, user-initiated network action, never
   silent.
@@ -133,9 +149,12 @@ implementation detail the frontend never depends on directly.
 See `MODEL_RUNTIME.md` for detail. Architecturally: the AI pipeline depends only on capability
 interfaces — `GenerationCapable` (`generate(prompt, schema) -> structured_output`) and
 `EmbeddingCapable` (`embed(text) -> vector`) — not on llama.cpp specifics, and not on the
-assumption that one model must serve both roles (`DECISIONS.md` D-011). V0.1 ships exactly one
-provider implementation, `LlamaCppProvider`, which may back either or both capabilities, run as a
-local subprocess/server bound to localhost.
+assumption that one model must serve both roles (`DECISIONS.md` D-011, completed by D-023: each
+capability gets its own health check, hardware feasibility accounts for both models' combined
+footprint if run simultaneously, and provenance records both models' identities separately). V0.1
+ships exactly one provider implementation, `LlamaCppProvider`, which may back either or both
+capabilities, run as a local subprocess/server bound to localhost and gated by its own
+authentication credential independent of the FastAPI↔frontend token (`DECISIONS.md` D-017).
 
 ## 7. Document Pipeline
 

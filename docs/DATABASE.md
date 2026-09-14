@@ -19,8 +19,12 @@ erDiagram
     CONTROL ||--o{ ASSESSMENT_CONTROL_SCOPE : "in scope of"
     ARTIFACT ||--o{ ARTIFACT_SECTION : "chunked into"
     ARTIFACT ||--o{ ANALYSIS_RUN : "analyzed by"
+    ANALYSIS_RUN ||--o{ ANALYSIS_RUN_SECTION_RESULT : "records outcome per"
+    ARTIFACT_SECTION ||--o{ ANALYSIS_RUN_SECTION_RESULT : "outcome recorded in"
+    ANALYSIS_RUN }o--o| ANALYSIS_RUN : "superseded by"
     ANALYSIS_RUN ||--o{ MAPPING_CANDIDATE : produces
-    ARTIFACT_SECTION ||--o{ MAPPING_CANDIDATE : "cited by"
+    ARTIFACT_SECTION ||--o{ MAPPING_CANDIDATE_SECTION : "cited via"
+    MAPPING_CANDIDATE ||--o{ MAPPING_CANDIDATE_SECTION : cites
     CONTROL ||--o{ MAPPING_CANDIDATE : "target of"
     CONTROL_ENHANCEMENT ||--o{ MAPPING_CANDIDATE : "target of"
     MAPPING_CANDIDATE ||--o{ ANALYST_DECISION : "decided by"
@@ -85,17 +89,34 @@ erDiagram
     ANALYSIS_RUN {
         string id PK
         string artifact_id FK
-        string status
+        string status "queued|running|succeeded|partially_succeeded|failed|cancelled|interrupted"
+        string superseded_by_analysis_run_id FK "nullable, self-referencing"
         string model_provider
         string model_identifier
         string model_version
         string model_digest
+        string embedding_model_identifier
+        string embedding_model_version
+        string embedding_model_digest
+        int embedding_dimensions
+        string embedding_normalization
+        string embedding_config_version
         string framework_id FK
         string framework_version
         string parser_version
         string chunker_version
         string prompt_template_version
         text inference_settings
+        datetime started_at
+        datetime completed_at
+    }
+    ANALYSIS_RUN_SECTION_RESULT {
+        string id PK
+        string analysis_run_id FK
+        string artifact_section_id FK
+        string outcome "no_candidates_retrieved|evaluated_no_mappings|evaluated_with_mappings|failed"
+        string failure_category "nullable, sanitized"
+        int attempt_count
         datetime started_at
         datetime completed_at
     }
@@ -119,6 +140,7 @@ erDiagram
     ANALYST_DECISION {
         string id PK
         string mapping_candidate_id FK
+        int revision "monotonic per mapping_candidate_id; authoritative ordering"
         string status
         string decided_by
         text notes
@@ -164,12 +186,27 @@ initial upload filter).
 
 ### analysis_run
 One row per analysis attempt against an artifact (`COMPLIANCE_MODEL.md` "AnalysisRun",
-`DECISIONS.md` D-012/D-013). `status`: `succeeded` / `succeeded_no_mappings` / `failed` /
-`superseded`. Carries the immutable configuration-identity fields (model/framework/parser/chunker/
-prompt versions) so they aren't duplicated per `mapping_candidate` row. A later run against the same
-artifact does not delete or mutate an earlier run's rows — mark the earlier run `superseded` instead
-(the mapping candidates it produced remain queryable for audit purposes; whether they're hidden by
-default in the review UI is a `USER_FLOWS.md` concern, not a schema one).
+`DECISIONS.md` D-012/D-013, revised by D-020/D-021/D-023). `status` is a pure execution-progress
+value — `queued` / `running` / `succeeded` / `partially_succeeded` / `failed` / `cancelled` /
+`interrupted` — derived from `analysis_run_section_result` rows, never asserted directly.
+`superseded_by_analysis_run_id` is a **separate**, nullable self-referencing FK recording an
+explicit replacement relationship; it is never inferred from a rerun simply having started, and a
+`failed`/`cancelled` replacement must never populate it on the prior run. Carries the immutable
+configuration-identity fields (generation model + embedding model identities, framework/parser/
+chunker/prompt versions — D-023 requires the embedding model's identity and index configuration be
+recorded separately from the generation model's) so they aren't duplicated per `mapping_candidate`
+row. A later run against the same artifact does not delete or mutate an earlier run's rows — the
+mapping candidates an earlier run produced remain queryable for audit purposes regardless of
+supersession, and still count toward current coverage unless an analyst explicitly reconsiders them
+(`COMPLIANCE_MODEL.md` §2 "Finding / Gap" — older-analysis handling).
+
+### analysis_run_section_result
+One row per (`analysis_run_id`, `artifact_section_id`) recording that section's own evaluation
+outcome within the run (`DECISIONS.md` D-020): `no_candidates_retrieved` / `evaluated_no_mappings` /
+`evaluated_with_mappings` / `failed`, a sanitized `failure_category` (no evidence content —
+`SECURITY.md` T-10) where applicable, `attempt_count`, and timing. `analysis_run.status` is computed
+from these rows, not stored independently of them — this is what prevents a run with many failed
+sections and one trivially successful one from reporting as blanket "succeeded."
 
 ### artifact_section
 `locator` is a human-meaningful pointer back into the source document (e.g. page number, heading
@@ -177,18 +214,28 @@ path, CSV row range) so the review UI can show "where in the document" beyond ju
 
 ### mapping_candidate
 Immutable once created (`COMPLIANCE_MODEL.md` §4). `source`: `ai` or `analyst_manual`
-(`DECISIONS.md` D-015). When `source = ai`, `analysis_run_id` is required and provenance fields
+(`DECISIONS.md` D-015). When `source = ai`, `analysis_run_id` is required, its `artifact_id` must
+match this row's own `artifact_id` (`COMPLIANCE_MODEL.md` §8 invariant 2), and provenance fields
 (`model_*`, framework/parser/prompt versions) live on the referenced `analysis_run`, not duplicated
 here. When `source = analyst_manual`, `analysis_run_id`, `confidence`, and `retrieval_method` are
 null — there is no run or model behind a manually-created mapping. Re-running analysis on an
 artifact creates a new `analysis_run` and new `mapping_candidate` rows rather than mutating old
-ones — old candidates remain for audit trail even if their run is later marked `superseded`.
+ones — old candidates remain for audit trail even if their run is later explicitly superseded via
+`analysis_run.superseded_by_analysis_run_id` (`DECISIONS.md` D-021). A new candidate never inherits
+an approval from an older run's analogous candidate — it always starts `needs_review`.
 
 ### analyst_decision
 Deterministically append-only: rows are only ever inserted, never updated or deleted. Current
-status for a mapping candidate = the decision row with the latest `decided_at` for that
-`mapping_candidate_id`. `decided_by` is the local user identity — in V0.1 single-user, likely a
-fixed local placeholder value rather than a real user table; revisit if multi-user is ever built.
+status for a mapping candidate = the decision row with the **highest `revision`** for that
+`mapping_candidate_id` — `revision` is a monotonically increasing integer assigned inside the write
+transaction, with a uniqueness constraint on (`mapping_candidate_id`, `revision`); ordering is never
+by `decided_at`, since wall-clock timestamps can collide or move backward across clock changes
+(`DECISIONS.md` D-024). A write is expected to state the revision it's extending; a write against a
+stale expected-revision is rejected (optimistic concurrency), so two concurrent decision submissions
+on the same candidate cannot silently overwrite each other. `decided_at` remains as descriptive
+audit metadata only. `decided_by` is a stable **local, unverified** identity — in V0.1 single-user,
+likely a fixed local placeholder value, explicitly documented as carrying no real authentication
+assurance; revisit if multi-user is ever built.
 
 ## 3. Extraction Outcomes
 
@@ -236,18 +283,40 @@ set couldn't distinguish these outcomes):
   `source = 'analyst_manual' AND analysis_run_id IS NULL`).
 - `analysis_run.artifact_id`: indexed — "all analysis attempts for this artifact," including
   superseded ones, is a core provenance/audit query.
-- `analyst_decision.mapping_candidate_id` + `decided_at`: indexed for "latest decision" lookups.
-- Foreign keys enforced (SQLite `PRAGMA foreign_keys = ON`), including `artifact.assessment_id` →
-  `assessment.id`, to make cross-assessment contamination a constraint violation, not just a bug.
-- **Cross-framework invariant** (`COMPLIANCE_MODEL.md` §8): `mapping_candidate.control_id`'s
-  framework must match `mapping_candidate.artifact_id`'s `assessment.framework_id`. SQLite foreign
-  keys alone don't express this (it spans two FK chains), so it must be enforced either via a
-  `CHECK`/trigger comparing denormalized `framework_id` columns, or as an application-layer
-  invariant enforced at write time in every code path that creates a `mapping_candidate` — this
-  must not be left as an assumption that "of course they'll always match," since a second framework
-  is explicitly planned future work that would otherwise make this a live risk.
-- `control.family_id`, when non-null, must reference a `control_family` whose `framework_id` matches
-  `control.framework_id` — same cross-chain caveat as above.
+- `analysis_run.superseded_by_analysis_run_id`: indexed; nullable self-referencing FK, set only by
+  an explicit action (`DECISIONS.md` D-021), never implied by a rerun merely starting.
+- `analysis_run_section_result.analysis_run_id` + `.artifact_section_id`: indexed; `analysis_run_id`
+  is the primary lookup for "compute this run's overall status from its section outcomes."
+- `analyst_decision`: unique index on (`mapping_candidate_id`, `revision`); current status is the
+  row with the max `revision` per candidate, not the max `decided_at` (`DECISIONS.md` D-024).
+  Writes should be guarded by an expected-revision check (optimistic concurrency) at the application
+  layer, since SQLite has no native "compare-and-swap on next sequence value" primitive.
+- Foreign keys enforced (SQLite `PRAGMA foreign_keys = ON`) on every connection — not assumed
+  enabled by default. This includes `artifact.assessment_id` → `assessment.id`, which prevents an
+  artifact from referencing a nonexistent/wrong assessment row.
+- **Individual foreign keys do not by themselves compose into full isolation** (`DECISIONS.md`
+  D-024) — the following are explicit, separately-enforced invariants, not assumptions that FKs
+  alone provide them:
+  - **Cross-framework invariant** (`COMPLIANCE_MODEL.md` §8 invariant 2): `mapping_candidate.
+    control_id`'s framework must match `mapping_candidate.artifact_id`'s `assessment.framework_id`.
+    Spans two separate FK chains, so enforce via a `CHECK`/trigger comparing denormalized
+    `framework_id` columns, or an application-layer invariant enforced at write time in every code
+    path that creates a `mapping_candidate` — not an assumption that "of course they'll always
+    match," since a second framework is explicitly planned future work.
+  - **Section-ownership invariant**: every `mapping_candidate_section.artifact_section_id` must
+    belong to the same `artifact_id` as the `mapping_candidate_section.mapping_candidate_id`'s own
+    `artifact_id` — a plain FK on each column doesn't prevent citing a section from a *different*
+    artifact than the one the candidate is about.
+  - **Run-ownership invariant**: for `source = 'ai'` rows, `mapping_candidate.analysis_run_id`'s
+    `artifact_id` must match `mapping_candidate.artifact_id`.
+  - **Enhancement-ownership invariant**: `mapping_candidate.enhancement_id`, when set, must belong
+    to `mapping_candidate.control_id`.
+  - **Scope-framework invariant**: `assessment_control_scope` entries must belong to the
+    assessment's own framework.
+  - **Citation uniqueness**: unique index on (`mapping_candidate_id`, `artifact_section_id`) in
+    `mapping_candidate_section` — no duplicate citation of the same section by the same candidate.
+  - `control.family_id`, when non-null, must reference a `control_family` whose `framework_id`
+    matches `control.framework_id` — same cross-chain caveat.
 
 ## 6. Migrations
 

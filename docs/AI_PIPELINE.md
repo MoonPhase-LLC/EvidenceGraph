@@ -66,10 +66,12 @@ producing a top-N (N to be tuned; start small, e.g. 5–10) candidate list per s
 method is recorded on the resulting Mapping Candidate's provenance (`retrieval_method`) so it can
 be audited/tuned later. Embedding similarity uses the active embedding-capable provider, which may
 be a different loaded model than the generation-capable provider used in §6 (`MODEL_RUNTIME.md` §1,
-`DECISIONS.md` D-011) — retrieval quality should be evaluated against a small hand-labeled sample
-starting in Sprint 8 itself (see `SPRINTS.md` Sprint 8), not deferred until the full evaluation
-harness in Sprint 14, so a poor retrieval/embedding choice is caught before later sprints build on
-it.
+`DECISIONS.md` D-011, completed by D-023) — retrieval quality should be evaluated against a small
+hand-labeled sample starting in Sprint 8 itself (see `SPRINTS.md` Sprint 8), not deferred until the
+full evaluation harness in Sprint 14, so a poor retrieval/embedding choice is caught before later
+sprints build on it. Whenever the embedding model/configuration changes, any previously computed
+embedding index is incompatible and must be rebuilt (`DECISIONS.md` D-023) — retrieval must never
+compare vectors produced under two different embedding configurations.
 
 Retrieval is not itself a source of Mapping Candidates — it only narrows what the LLM evaluation
 stage considers.
@@ -154,33 +156,49 @@ threshold exists in V0.1. See `COMPLIANCE_MODEL.md` §4.
 ## 11. AI Failure Handling
 
 Every analysis attempt against an artifact is tracked as an `AnalysisRun`
-(`COMPLIANCE_MODEL.md` "AnalysisRun", `DECISIONS.md` D-012), whose `status` is one of `succeeded` /
-`succeeded_no_mappings` / `failed` / `superseded` — this is what lets the failure modes below be
-distinguished from "never analyzed" and from each other, rather than only being visible as the
-absence of Mapping Candidates.
+(`COMPLIANCE_MODEL.md` "AnalysisRun", `DECISIONS.md` D-012, revised by D-020). Its `status` is a
+pure execution-progress value — `queued` / `running` / `succeeded` / `partially_succeeded` /
+`failed` / `cancelled` / `interrupted` — **derived from persisted per-section outcomes**
+(`AnalysisRunSectionResult`: `no_candidates_retrieved` / `evaluated_no_mappings` /
+`evaluated_with_mappings` / `failed` per artifact section), never asserted at the run level
+directly. This is what lets the failure modes below be distinguished from "never analyzed," from
+each other, and — critically — from a run that only *partially* completed, rather than a
+few-failures-among-many-successes run silently reporting as blanket "succeeded."
 
 Failure modes and required behavior — must never fail silently or fall back to a remote provider:
 
 - **Model unavailable / not running**: surface a clear error in the UI; do not queue silently
   forever without status; do not fall back to any cloud provider (`CLAUDE.md`/`AGENT_INSTRUCTIONS.md`
-  hard rule). The `AnalysisRun` is marked `failed`.
-- **Model returns malformed output**: retry once with the same input; on second failure, mark
-  that section/control-candidate evaluation as failed and move on — one failed section must not
-  abort analysis of the rest of the artifact. If every section fails this way, the `AnalysisRun` as
-  a whole is `failed`; if some succeed, the run is `succeeded` (or `succeeded_no_mappings` if none
-  of the successful evaluations produced a relevant relationship).
-- **Model times out**: bounded timeout per evaluation call (value TBD); treat as failure per
-  above.
-- **Retrieval finds zero candidate controls for a section**: valid outcome, not an error; the
-  section simply produces no Mapping Candidates. If this is true for every section in the artifact,
-  the `AnalysisRun` is `succeeded_no_mappings` — a legitimate, non-failure terminal state, distinct
-  from `failed`.
+  hard rule). If this happens before any section is processed, the `AnalysisRun` is `failed`; if it
+  happens mid-run after some sections already completed, those sections' results are preserved and
+  the run is `partially_succeeded`, not retroactively `failed`.
+- **Model returns malformed output**: retry once with the same input; on second failure, record
+  that section's `AnalysisRunSectionResult` as `failed` with a sanitized failure category (no
+  evidence content — `SECURITY.md` T-10) and move on — one failed section must not abort analysis
+  of the rest of the artifact. The run's overall status is computed from all sections' outcomes once
+  the run completes (`succeeded` if none failed, `partially_succeeded` if some did and some didn't,
+  `failed` if all did).
+- **Model times out**: bounded timeout per evaluation call (value TBD); record as a `failed`
+  section outcome per above.
+- **Retrieval finds zero candidate controls for a section**: valid outcome, not an error; recorded
+  as `no_candidates_retrieved` for that section, contributing to a `succeeded` (not `failed`) run
+  status. A run where every section reaches `no_candidates_retrieved` or `evaluated_no_mappings` is
+  `succeeded` with zero Mapping Candidates produced — a legitimate, non-error, non-partial outcome,
+  distinct from a run that is `partially_succeeded` or `failed` because some sections could not be
+  evaluated at all. "Zero mappings" and "execution status" are independent facts; never conflate a
+  run that produced no mappings with one that failed to examine its evidence.
 - **Whole artifact fails to parse**: artifact `parse_status` is marked `failed` (or
   `unsupported_format` / `empty` — see `DATABASE.md` §3 "Extraction Outcomes" for the full set); no
   analysis is attempted, no `AnalysisRun` is created; visible to the user, not hidden.
-- **Re-running analysis on an already-analyzed artifact**: creates a new `AnalysisRun`; the prior
-  run (and the Mapping Candidates it produced) is marked `superseded`, not deleted — old candidates
-  and their Analyst Decisions remain queryable for audit purposes.
+- **App/process terminated mid-run**: an `AnalysisRun` left in `running` state across a restart is
+  detected and relabeled `interrupted` rather than left ambiguously "running" forever or silently
+  reported as a terminal state it never reached.
+- **Re-running analysis on an already-analyzed artifact**: creates a new `AnalysisRun`. Supersession
+  of the prior run is a **separate, explicit** action (`analysis_run.superseded_by_analysis_run_id`,
+  `DECISIONS.md` D-021) — it is never implied merely by starting a rerun, and a `failed` or
+  `cancelled` rerun must never supersede a prior successful run. Old candidates and their Analyst
+  Decisions are never deleted, and a new candidate never inherits an approval from an older run's
+  analogous suggestion — it always starts `needs_review`.
 
 ## 12. Prompt Injection Resistance
 

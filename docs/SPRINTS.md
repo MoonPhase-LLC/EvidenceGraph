@@ -46,11 +46,13 @@ code written; open questions documented rather than silently resolved.
 minimal skeleton, before building real features on top of an unvalidated assumption.
 
 **Deliverables:** Tauri app shell that launches; FastAPI local service spawned as a child process,
-bound to localhost and authenticated via the per-launch shared-secret token (`DECISIONS.md` D-009);
-a minimal frontend screen that calls one localhost API endpoint and displays the result; basic
-project tooling (linting, formatting, test runners) wired up for both the Rust/TS and Python sides;
-CI running those checks on PRs; a narrow **packaged-build spike** (see S1-09 in
-`docs/SPRINT_1_BACKLOG.md`) that runs the Tauri bundler to produce an installable package
+bound to localhost and authenticated via the per-launch shared-secret token plus the fail-closed
+startup identity-verification handshake (`DECISIONS.md` D-009, D-018) — not just a token check, but
+verifying the service Tauri is talking to is actually the one it spawned before any credential or
+data crosses the boundary; a minimal frontend screen that calls one localhost API endpoint and
+displays the result; basic project tooling (linting, formatting, test runners) wired up for both
+the Rust/TS and Python sides; CI running those checks on PRs; a narrow **packaged-build spike** (see
+S1-09 in `docs/SPRINT_1_BACKLOG.md`) that runs the Tauri bundler to produce an installable package
 embedding the Python service, and launches that package on a clean Windows machine (not just `tauri
 dev`) — distinct from and much smaller than Sprint 16's full packaging/release work, but validating
 the actual riskiest assumption (`DECISIONS.md` D-001) far earlier than "Sprint 16" would otherwise
@@ -69,11 +71,13 @@ spike's outcome (clean pass / needs follow-up mitigation) before treating D-001'
 **Dependencies:** Sprint 0 docs.
 
 **Exit criteria:** App launches on Windows in dev mode; frontend successfully round-trips a call to
-the local service through the authenticated channel; CI passes on a clean checkout; the
-packaged-build spike produces a launchable installed package on a machine without dev tooling, or
-documents a concrete blocking issue and mitigation plan; the Python-runtime-bundling risk flagged in
-`DECISIONS.md` D-001 is either resolved or has a concrete mitigation plan grounded in that spike's
-actual result, not just a dev-mode assumption. See `docs/SPRINT_1_BACKLOG.md` for tickets.
+the local service through the authenticated, identity-verified channel (D-018's handshake, not just
+a bearer-token check); an occupied-port / impersonating-process test case is demonstrated to fail
+closed rather than leak the token; CI passes on a clean checkout; the packaged-build spike produces
+a launchable installed package on a machine without dev tooling, or documents a concrete blocking
+issue and mitigation plan; the Python-runtime-bundling risk flagged in `DECISIONS.md` D-001 is
+either resolved or has a concrete mitigation plan grounded in that spike's actual result, not just a
+dev-mode assumption. See `docs/SPRINT_1_BACKLOG.md` for tickets.
 
 ---
 
@@ -131,26 +135,34 @@ extraction/chunking for PDF/DOCX/TXT/CSV.
 
 **Deliverables:** Upload API/UI; artifact + artifact_section tables and migration; parsers with
 the size/decompression/path-traversal mitigations from `SECURITY.md`; **the parser containment
-boundary itself** (subprocess isolation or equivalent — the specific mechanism per
-`OPEN_QUESTIONS.md` S-1, but decided and implemented here, not deferred — `DECISIONS.md` D-010);
-the full `artifact.parse_status` extraction-outcome taxonomy (`DATABASE.md` §3: `parsed` / `partial`
-/ `empty` / `unsupported_format` / `failed`, not just a binary success/fail); per-file ingestion
+boundary itself**, meeting the specific permission requirements in `DECISIONS.md` D-022 (read-only
+on its own input, write access limited to scratch, no DB/credential/network access, resource
+bounds) — the specific mechanism providing these properties is still per `OPEN_QUESTIONS.md` S-1,
+but the properties themselves and a proof they hold are decided and implemented here, not deferred,
+and "wrapped in a subprocess" alone does not satisfy this requirement; the full
+`artifact.parse_status` extraction-outcome taxonomy (`DATABASE.md` §3: `parsed` / `partial` /
+`empty` / `unsupported_format` / `failed`, not just a binary success/fail); per-file ingestion
 status UI.
 
 **Claude Code responsibilities:** Upload UI, ingestion status UI.
 
-**Codex responsibilities:** Parsers, the containment boundary implementation, hashing/duplicate
-detection, backend tests including adversarial file inputs.
+**Codex responsibilities:** Parsers, the containment boundary implementation, a containment test
+harness (D-022: a test worker that deliberately attempts to read unrelated evidence, open the
+database, reach the network, or exceed a resource bound, and is verified to be denied/terminated),
+hashing/duplicate detection, backend tests including adversarial file inputs.
 
 **Human responsibilities:** Approve file size/count limits; approve the specific containment
-mechanism (subprocess vs. WASM vs. another approach).
+mechanism (subprocess + restricted token/job object vs. WASM vs. another approach) — the required
+*properties* are fixed by D-022, only the mechanism choice is open.
 
 **Dependencies:** Sprint 2.
 
 **Exit criteria:** PDF/DOCX/TXT/CSV upload works; malicious/oversized/malformed test files are
 rejected safely, not crash the app, and are contained by the boundary decided in this sprint (not a
-placeholder); duplicate files are flagged; every parse outcome maps to one of the defined
-`parse_status` values, not just success/fail; no evidence content appears in logs.
+placeholder); the containment test harness demonstrates the worker cannot read unrelated evidence,
+reach the database, reach the network, or exceed its resource bounds — containment is verified, not
+assumed from process separation alone; duplicate files are flagged; every parse outcome maps to one
+of the defined `parse_status` values, not just success/fail; no evidence content appears in logs.
 
 ---
 
@@ -158,13 +170,17 @@ placeholder); duplicate files are flagged; every parse outcome maps to one of th
 
 **Objective:** Implement `ModelProvider` and `LlamaCppProvider` per `docs/MODEL_RUNTIME.md`.
 
-**Deliverables:** `ModelProvider` interface; `LlamaCppProvider` implementation; manual model
-import (GGUF) flow; health check; start/stop lifecycle.
+**Deliverables:** `GenerationCapable`/`EmbeddingCapable` interfaces; `LlamaCppProvider`
+implementation; manual model import (GGUF) flow; capability-specific health checks (a bounded real
+generation for `GenerationCapable`, a finite-vector check for `EmbeddingCapable` — `DECISIONS.md`
+D-023); the model-runtime server's own independent auth credential, generated and held by FastAPI
+and never exposed to the frontend (`DECISIONS.md` D-017); start/stop lifecycle.
 
 **Claude Code responsibilities:** Model management UI (import, start/stop, health status).
 
-**Codex responsibilities:** `ModelProvider` interface and `LlamaCppProvider` implementation,
-subprocess/lifecycle management, structured-output/grammar integration.
+**Codex responsibilities:** `ModelProvider` capability interfaces and `LlamaCppProvider`
+implementation, subprocess/lifecycle management, the model-server credential mechanism (D-017),
+structured-output/grammar integration.
 
 **Human responsibilities:** Approve which initial GGUF model(s) are used for development/testing.
 
@@ -179,9 +195,12 @@ a structured JSON response to a test prompt, and stopped — fully offline after
 
 **Objective:** Implement hardware detection and the model catalog/recommendation logic.
 
-**Deliverables:** Hardware detection module; model catalog manifest format + initial curated
-catalog; recommendation logic (feasible/recommended per model); FAST/BALANCED/ACCURATE/CUSTOM tier
-UI; model download with checksum verification.
+**Deliverables:** Hardware detection module; model catalog manifest format (including the `roles`
+field distinguishing generation/embedding entries — `DECISIONS.md` D-023) + initial curated catalog;
+recommendation logic (feasible/recommended per model, budgeting the **combined** footprint when
+separate generation and embedding models are configured to run simultaneously, with sequential
+loading as a documented fallback when combined footprint doesn't fit); FAST/BALANCED/ACCURATE/CUSTOM
+tier UI; model download with checksum verification.
 
 **Claude Code responsibilities:** Model selection UI (tiers, recommendations, download progress).
 
@@ -225,18 +244,23 @@ is persisted and distinguishable from the AI-assigned value.
 **Objective:** Implement candidate control retrieval and LLM evaluation producing validated
 Mapping Candidates, per `docs/AI_PIPELINE.md`.
 
-**Deliverables:** Embedding-based + lexical retrieval; evaluation prompt template with
+**Deliverables:** Embedding-based + lexical retrieval, with embedding-index rebuilds triggered on
+any embedding-configuration change (`DECISIONS.md` D-023); evaluation prompt template with
 injection-resistance measures; structured output schema implementation; deterministic validation;
-`analysis_run` and `mapping_candidate` (+ join table) migrations and persistence
+`analysis_run` (execution-progress status, embedding provenance, supersession field),
+`analysis_run_section_result` (per-section outcome), `mapping_candidate` (+ join table), and
+`analyst_decision` (revision-based ordering, `DECISIONS.md` D-024) migrations and persistence
 (`DATABASE.md`); a **small hand-labeled evaluation sample** (a handful of artifacts with
 known-correct mappings, not the full Sprint 14 harness) used to sanity-check retrieval and mapping
 quality before the rest of the review/graph/gap features are built on top of this pipeline.
 
-**Claude Code responsibilities:** Mapping review UI (list/detail, approve/reject/needs-review).
+**Claude Code responsibilities:** Mapping review UI (list/detail, approve/reject/needs-review,
+surfacing the Coverage Signals from `COMPLIANCE_MODEL.md` — not a computed sufficiency verdict).
 
 **Codex responsibilities:** Retrieval implementation, LLM evaluation orchestration, schema
-validation, provenance persistence, adversarial testing (prompt injection test fixtures), running
-the small evaluation sample and reporting baseline retrieval/mapping quality.
+validation, per-section outcome persistence and run-status derivation (`DECISIONS.md` D-020),
+provenance persistence, adversarial testing (prompt injection test fixtures), running the small
+evaluation sample and reporting baseline retrieval/mapping quality.
 
 **Human responsibilities:** Review mapping quality on real/sample evidence; approve retrieval
 tuning (top-N, thresholds); provide or approve the small hand-labeled evaluation sample (a scoped-
@@ -246,10 +270,14 @@ down precursor to Sprint 14's full set, not a replacement for it).
 
 **Exit criteria:** Running analysis on a test artifact produces schema-valid Mapping Candidates
 with correct provenance, each attributable to an `analysis_run` with full configuration identity
-(`DECISIONS.md` D-013); a crafted prompt-injection test document does not alter system behavior
-beyond producing an (still-human-reviewed) mapping candidate; the small evaluation sample shows
-retrieval/mapping quality is not obviously broken (not a formal precision/recall gate — that's
-Sprint 14) before later sprints build on this pipeline.
+(`DECISIONS.md` D-013, D-023); a test case with some sections succeeding and some deliberately
+failing produces an `analysis_run` correctly reporting `partially_succeeded`, not `succeeded`
+(`DECISIONS.md` D-020); a crafted prompt-injection test document does not alter system behavior
+beyond producing an (still-human-reviewed) mapping candidate; two concurrent Analyst Decision writes
+on the same candidate are resolved deterministically via revision, not by wall-clock race
+(`DECISIONS.md` D-024); the small evaluation sample shows retrieval/mapping quality is not obviously
+broken (not a formal precision/recall gate — that's Sprint 14) before later sprints build on this
+pipeline.
 
 ---
 
@@ -320,23 +348,33 @@ acceptable at the target scale defined by the product owner.
 
 ## Sprint 12 — Gap Analysis
 
-**Objective:** Implement the computed gap/finding logic from `docs/COMPLIANCE_MODEL.md` §2 and
-`DECISIONS.md` D-006.
+**Objective:** Implement the computed gap/finding logic and Coverage Signals from
+`docs/COMPLIANCE_MODEL.md` §2 and `DECISIONS.md` D-006/D-019.
 
-**Deliverables:** Gap query logic (no/weak evidence per control); gap review UI.
+**Deliverables:** Coverage-signal query logic (Support present / Partial support present /
+Confirmed conflict / References only / Review pending / Analysis incomplete — computed
+independently and shown together, never collapsed into one verdict); gap view = controls without
+"Support present," explicitly including partial-only controls (`DECISIONS.md` D-019 — this
+corrected an earlier design that removed partial-only controls from the gap view entirely); gap
+review UI.
 
-**Claude Code responsibilities:** Gap review UI.
+**Claude Code responsibilities:** Gap review UI, showing multiple simultaneous signals per control
+rather than a single status.
 
-**Codex responsibilities:** Gap computation query logic, tests covering edge cases (partial
-baselines, rejected-only mappings, etc.).
+**Codex responsibilities:** Coverage-signal and gap computation query logic, tests covering edge
+cases (partial baselines, rejected-only mappings, partial-only support, superseded-run mappings
+still counting toward coverage with an "older analysis" flag per `DECISIONS.md` D-021, confirmed
+conflicts coexisting with support).
 
 **Human responsibilities:** Resolve the baseline/applicability open question from `USER_FLOWS.md`
 §11.
 
 **Dependencies:** Sprints 3, 10.
 
-**Exit criteria:** Gap list correctly reflects controls with no approved evidence, distinguishing
-"no mappings at all" from "mappings exist but are rejected/low-confidence."
+**Exit criteria:** Gap list correctly reflects controls without "Support present," distinguishing
+"no mappings at all" from "mappings exist but are rejected" from "only partial/reference-only
+support approved" from "analysis incomplete"; a control with both approved support and an approved
+conflict shows both signals, not one overriding the other.
 
 ---
 

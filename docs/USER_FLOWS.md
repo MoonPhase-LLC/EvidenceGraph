@@ -121,12 +121,23 @@ vs. thousands of nodes); whether graph state (layout, filters) persists per asse
 
 ## 11. Gap Review
 
-1. User sees a list of controls with no `approved` `SUPPORTS`/`PARTIALLY_SUPPORTS` mapping, within
-   the assessment's scope (`COMPLIANCE_MODEL.md` §2 "Finding / Gap" — an approved `CONFLICTS_WITH`
-   or `REFERENCES` mapping never counts as coverage, so a control with only those is still a gap).
-2. A confirmed `CONFLICTS_WITH` mapping is surfaced as its own signal alongside the gap view (not a
-   gap-severity sub-category) — it means something different (evidence appears to contradict the
-   control) than an absence of evidence.
+1. User sees a list of controls **without** an approved `SUPPORTS` mapping ("Support present" —
+   `COMPLIANCE_MODEL.md` §2 "Finding / Gap", "Coverage Signals"). This is not a single verdict per
+   control but a set of independent, simultaneously-possible signals: Partial support present,
+   Confirmed conflict, References only, Review pending, Analysis incomplete. A control with an
+   approved `PARTIALLY_SUPPORTS` mapping and nothing else **stays in this view** as unresolved — it
+   is not treated as closed out just because some evidence exists (`DECISIONS.md` D-019 corrected an
+   earlier design that removed partial-only controls from the gap view entirely).
+2. A confirmed `CONFLICTS_WITH` mapping is surfaced as its own signal, and can coexist with
+   "Support present" on the same control (e.g. one section supports a control while another
+   conflicts with it) — the UI must show both, never collapse them into a single status.
+3. "Analysis incomplete" means relevant analysis failed, is pending, or only partially completed
+   (`DECISIONS.md` D-020) — the UI must not present this as "no evidence found," since that would be
+   an unreviewed conclusion the system isn't entitled to draw yet.
+4. A mapping contributing to a control's coverage that originated from a since-superseded analysis
+   run is visibly flagged as based on an older analysis (`DECISIONS.md` D-021), prompting the
+   analyst to re-confirm, replace, or withdraw it rather than silently trusting or silently losing
+   it.
 
 Open questions: whether gap analysis considers control baseline/applicability, or naively expects
 every control in the framework to have evidence.

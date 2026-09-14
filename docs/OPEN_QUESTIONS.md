@@ -51,12 +51,15 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
 - U-6: What deletion/retention semantics are expected for assessments and evidence — hard delete,
   soft delete, or a retention window — given the audit-trail requirements elsewhere in the
   product? (`USER_FLOWS.md` §5, `SECURITY.md` T-17)
-- U-7: Should an analyst be able to explicitly override the computed "evidence sufficiency"
-  judgment for a control (e.g. mark a control as sufficiently covered despite only
-  `PARTIALLY_SUPPORTS` mappings, with a note explaining why), or is V0.1's purely computed
-  sufficiency view (`COMPLIANCE_MODEL.md` "Evidence Sufficiency") final for V0.1? An override would
-  itself need its own audit trail if added — not a small addition, so worth a deliberate decision
-  rather than adding it opportunistically later.
+- U-7: V0.1 no longer computes an automatic "evidence sufficiency" verdict at all — it reports
+  independent factual Coverage Signals instead (`DECISIONS.md` D-019, `COMPLIANCE_MODEL.md`
+  "Coverage Signals"), so there is no computed field left to override. The open question is now:
+  should V0.1 (or a near-term follow-up) add an explicit, human-authored "this control is
+  adequately addressed" decision — with its own rationale and append-only history, analogous to an
+  Analyst Decision — or is showing the raw signals (support/partial/conflict/references/pending/
+  incomplete) and leaving any holistic judgment entirely outside the tool sufficient for V0.1? Such
+  a decision would need its own audit trail if added, so it's worth a deliberate product call rather
+  than adding it opportunistically.
 
 ## Architecture
 

@@ -51,14 +51,15 @@ does not eliminate the need to validate.
 
 ## 3. Model Catalog
 
-A manifest describing available/recommended models, e.g.:
+A manifest describing available/recommended models, e.g. (size in bytes, four and a half billion):
 
 ```json
 {
   "model_id": "example-7b-instruct-q4_k_m",
   "display_name": "Example 7B Instruct (Q4_K_M)",
   "format": "gguf",
-  "size_bytes": 4_500_000_000,
+  "size_bytes": 4500000000,
+  "roles": ["generation"],
   "min_ram_gb": 8,
   "recommended_ram_gb": 16,
   "min_vram_gb": null,
@@ -70,6 +71,12 @@ A manifest describing available/recommended models, e.g.:
   "source": "..."
 }
 ```
+
+`roles` (`DECISIONS.md` D-023) declares which capability/capabilities a catalog entry supports:
+`["generation"]`, `["embedding"]`, or both. Capability-specific fields apply only to the relevant
+role(s) — `context_window` is a generation concern; an embedding-role entry instead carries
+`embedding_dimensions` and `embedding_normalization` (e.g. `"cosine"`/`"l2"`) so the app knows how
+to use its output without guessing.
 
 The catalog is data (a manifest file, versioned with the app or fetched from a pinned source —
 exact hosting TBD), not hardcoded model-selection logic. This is what lets recommendations be
@@ -101,6 +108,16 @@ Given detected hardware and the model catalog, compute which catalog entries are
 Map catalog entries to the FAST/BALANCED/ACCURATE/CUSTOM tiers via a `tier` field on each catalog
 entry (author-assigned when the catalog is curated), not computed from raw specs — tier is a
 product/UX grouping, feasibility is a hardware-fit computation; keep them as separate concerns.
+
+**Combined footprint when generation and embedding are separate models (`DECISIONS.md` D-023):**
+when the user's configuration selects a distinct generation model and embedding model intended to
+run simultaneously, feasibility must be computed against their **combined** RAM/VRAM requirement,
+not each in isolation — recommending two models that individually fit but jointly exceed available
+memory is a feasibility computation bug, not an edge case to ignore. If the combined footprint
+doesn't fit the detected hardware, the app supports **sequential loading** as a documented fallback:
+load the embedding model only while indexing/retrieving, swap to the generation model for
+evaluation, rather than silently failing or crashing. Hardware that can't support either the
+combined or sequential path for any catalog entry is reported as infeasible, not left ambiguous.
 
 ## 6. Model Download
 
@@ -136,19 +153,50 @@ not verified by the app, distinct from a catalog download.
 
 ## 9. Health Checking
 
-`health_check()` should confirm the runtime process is alive **and** capable of serving a
-minimal generation request, not just "process exists" — a hung subprocess should be detectable.
-Used at: model start confirmation, and optionally a periodic/on-demand check surfaced in Settings.
+`health_check()` must be capability-specific (`DECISIONS.md` D-023) — a generation-only or
+embedding-only provider must never be health-checked via a call it doesn't support:
 
-## 10. Localhost Security
+- `GenerationCapable.health_check()` performs a minimal, bounded real `generate()` call and
+  confirms a well-formed response — not just "process exists"; a hung subprocess that accepts
+  connections but never responds must be detectable.
+- `EmbeddingCapable.health_check()` performs a minimal `embed()` call on a fixed short string and
+  confirms the returned vector is finite (no NaN/Inf values) and has the dimensionality expected for
+  the loaded model.
+
+Used at: model start confirmation (per capability), and optionally a periodic/on-demand check
+surfaced in Settings.
+
+## 10. Localhost Security and Model-Server Authentication
 
 The llama.cpp server (if run in server mode) must bind to `127.0.0.1` only, exactly like the
 FastAPI service (`SECURITY.md` T-09). No LAN or public interface binding in V0.1 under any
-configuration. Localhost binding is a network-reachability control, not authentication — the
-llama.cpp server is only ever called by the FastAPI service (never directly by the frontend), so it
-inherits the FastAPI service's own boundary rather than needing its own shared-secret token; the
-requirement is that nothing outside the FastAPI service process can reach it, which localhost
-binding alone accomplishes here since it has exactly one intended caller.
+configuration.
+
+**Localhost binding is not authentication.** An earlier draft of this document claimed that
+binding alone was sufficient because the model server "has exactly one intended caller" (FastAPI).
+That is incorrect: any other local process can open a TCP connection to a `127.0.0.1`-bound port
+and issue requests directly, regardless of who the design *intends* to be calling it — "intended
+caller" is not an enforcement mechanism (`DECISIONS.md` D-017).
+
+The model-runtime server therefore requires its own independently generated credential, separate
+from the D-009 frontend↔FastAPI session token:
+
+- FastAPI generates a fresh random credential each time it starts a model-runtime instance, and
+  holds it entirely within the backend process boundary — it is **never** sent to the frontend and
+  never leaves local process space.
+- Every inference request, and any administrative/introspection endpoint, must present this
+  credential; requests without it are rejected before any processing. A pure liveness-only health
+  endpoint may be explicitly exempted if the runtime distinguishes one from inference-capable
+  endpoints — document which endpoints are exempt, don't assume.
+- The credential is passed to the child the same way as the D-009 token (environment variable
+  scoped to that child process, or an equivalent inherited-handle mechanism) — never a CLI argument,
+  never logged (`SECURITY.md` T-10).
+- If llama.cpp's server mode has no native per-request auth, FastAPI fronts it with a thin
+  authenticating wrapper in the same process boundary so that no unauthenticated path to the model
+  server exists, even as a side channel around the wrapper.
+
+Binding to loopback remains required as defense-in-depth, but is no longer described as sufficient
+on its own — see `SECURITY.md` T-23.
 
 ## 11. Offline Mode
 

@@ -81,7 +81,13 @@ policy statements would essentially be a finer-grained section type.
 
 ## D-005: "Approved Mapping" is a Mapping Candidate + latest Analyst Decision, not a separate table
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-024
+
+**Note (added by D-024):** "Latest decision" below was originally timestamp-only (`decided_at`).
+A second-round review correctly noted equal/ambiguous timestamps and clock changes make
+timestamp-only ordering non-deterministic. D-024 replaces "latest by `decided_at`" with a
+monotonically increasing per-candidate revision number as the authoritative ordering; `decided_at`
+remains as descriptive audit metadata only.
 
 **Context:** The brief's language ("mapping candidates," "approved mappings") could imply two
 separate tables.
@@ -156,7 +162,15 @@ singleton), just not built in V0.1.
 
 ## D-010: Parser containment boundary is decided and built in Sprint 4, not deferred to Sprint 13
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-022
+
+**Note (added by D-022):** A second-round review correctly flagged that this entry's original
+consequences text ("a size/time-limited subprocess-per-parse ... is sufficient") equates process
+isolation with exploit containment, which is false — an ordinary subprocess with inherited
+filesystem/network/credential access does not stop exploited parser code from reading other
+evidence, the database, or model credentials, or reaching the network. D-022 replaces "a subprocess
+is sufficient" with a specific set of required permission restrictions the containment mechanism
+must provide; a subprocess is a plausible *mechanism* for meeting them, not a substitute for them.
 
 **Context:** `SPRINTS.md` originally left the parser sandboxing *approach* as an open question
 (`SECURITY.md` S-1) to be resolved during Sprint 13 ("Security Hardening"), while Sprint 4
@@ -183,7 +197,12 @@ rule.
 
 ## D-011: Generation and embedding are independent capabilities in the model runtime
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-023
+
+**Note (added by D-023):** Splitting the interface (below) without also splitting the *dependent
+contracts* left several gaps: a shared health check that only exercises generation, hardware
+recommendations that don't budget for two simultaneously loaded models, and provenance that
+records only one model identity. D-023 closes these.
 
 **Context:** `MODEL_RUNTIME.md` originally described a single `ModelProvider` with both
 `generate()` and `embed()` methods, implicitly served by one loaded model, and D-008 said "V0.1
@@ -210,7 +229,17 @@ retrieval quality testing (see D-012 note on evaluation timing).
 
 ## D-012: AnalysisRun entity added to track analysis attempts and bundle analysis configuration
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-020 and D-021
+
+**Note (added by D-020/D-021):** The original `status` enum (`succeeded` / `succeeded_no_mappings`
+/ `failed` / `superseded`) conflated three different axes: execution progress (did the run finish,
+partially finish, or crash), output volume (did it produce zero mappings), and supersession (has a
+later run replaced this one). A second-round review correctly noted this lets a run with many
+failed sections and one trivially-successful section report as blanket "succeeded" or
+"succeeded_no_mappings," silently converting unexamined evidence into an apparent absence-of-
+evidence conclusion. D-020 replaces `status` with a pure execution-progress enum plus per-section
+outcome records; D-021 removes `superseded` from `status` entirely and represents supersession as
+its own explicit relationship, separate from execution outcome. See both below.
 
 **Context:** The original model could not distinguish "this artifact was never analyzed" from
 "analysis ran and legitimately found nothing" from "analysis failed" from "this artifact was
@@ -260,7 +289,17 @@ implicitly required.
 
 ## D-014: Coverage semantics exclude CONFLICTS_WITH and REFERENCES; CONFLICTS_WITH is per-section, not cross-artifact
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-019
+
+**Note (added by D-019):** This entry correctly excluded `CONFLICTS_WITH`/`REFERENCES` from
+coverage, but the follow-on "Evidence Sufficiency" concept added afterward (in the same review
+round) reintroduced a similar problem one level up: it declared a control "sufficiently covered"
+automatically from one approved `SUPPORTS` mapping, with `PARTIALLY_SUPPORTS`-only treated as fully
+resolved rather than remaining visible as a gap. A second-round review correctly identified this as
+an unreviewed automatic judgment inconsistent with this project's human-authority principle
+(`PRODUCT.md` principle 3, `COMPLIANCE_MODEL.md` §4). D-019 removes the automatic "sufficiency"
+label entirely and replaces it with independent, factual coverage-state signals, keeping
+partial-only coverage in the unresolved/gap view rather than closing it out.
 
 **Context:** Two related issues in the original model. First, `DECISIONS.md` D-006 and
 `COMPLIANCE_MODEL.md`'s gap definition ("no `approved` mapping, or only low-confidence /
@@ -348,7 +387,16 @@ question.
 
 ## D-009: Authenticated local IPC via a per-launch shared-secret token
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-018
+
+**Note (added by D-018):** A bearer token authenticates a *caller* to a server; it does not
+authenticate the *server* to the caller. As originally written, this decision did not close the
+port-allocation race already flagged as an open question (`OPEN_QUESTIONS.md` A-1): if another
+process occupied the selected loopback port before or instead of the real FastAPI service, Tauri
+could hand that impostor the frontend's bearer token and, subsequently, evidence. D-018 adds a
+fail-closed startup handshake that verifies the actual child process's identity before any token or
+evidence is sent to the endpoint. The token mechanism below is still required; D-018 is what makes
+it safe to rely on.
 
 **Context:** D-007 conflated "localhost-only binding" with "authenticated." A local unprivileged
 process (threat A2 in `SECURITY.md`) can reach a `127.0.0.1`-bound port without needing network
@@ -370,6 +418,365 @@ credential management, no login flow. Closes the gap where any other local proce
 call the analysis API, trigger local model inference, or read assessment data merely by reaching
 the port. `AGENT_INSTRUCTIONS.md` rule 13 is updated to reference this mechanism. See
 `ARCHITECTURE.md` §4 and `SECURITY.md` T-09.
+
+---
+
+## D-017: The local model-runtime server has its own independent authentication credential
+
+**Status:** Accepted
+
+**Context:** `MODEL_RUNTIME.md` §10 previously claimed that binding the llama.cpp server to
+`127.0.0.1` was sufficient because "it has exactly one intended caller" (the FastAPI service). A
+second-round review correctly identified this as the same mistake D-009 fixed for the frontend↔
+FastAPI boundary, recurring one hop downstream: "intended caller" is a design assumption, not an
+enforcement mechanism. Any other local process can still open a TCP connection to a
+`127.0.0.1`-bound port and issue inference requests directly, bypassing FastAPI's own auth entirely
+and reaching the model runtime — and, transitively, whatever evidence-derived content the pipeline
+sends it — without ever presenting the D-009 token (which authenticates callers of FastAPI, not
+callers of llama.cpp).
+
+**Decision:** The model-runtime server requires its own independently generated credential,
+distinct from the D-009 frontend↔FastAPI token:
+
+- FastAPI (not Tauri, not the frontend) generates a fresh random credential each time it starts a
+  model-runtime instance and holds it entirely within the backend process boundary — it is never
+  sent to the frontend and never leaves the machine's local process space.
+- Every inference and administrative request to the model-runtime server must present this
+  credential; requests without it are rejected before any processing occurs. A basic liveness-only
+  health endpoint may be explicitly exempted if the runtime supports one, but inference and any
+  endpoint that reveals loaded-model state or accepts input must require the credential.
+- The credential is never written to logs (`SECURITY.md` T-10) and never appears in a CLI
+  argument (visible via the OS process list) — pass it the same way as the D-009 token, via an
+  environment variable scoped to the child process, or an equivalent inherited-handle mechanism.
+- If llama.cpp's server mode cannot itself enforce per-request header authentication, FastAPI must
+  front it with a thin authenticating wrapper/reverse-proxy in the same process boundary, such that
+  no request reaches llama.cpp without having first passed the credential check — an unauthenticated
+  path directly to llama.cpp's port must not exist as a side channel around the wrapper.
+- Loopback-only binding (`MODEL_RUNTIME.md` §10) remains required as defense-in-depth, but is no
+  longer described as sufficient on its own.
+
+**Consequences:** Small addition to Sprint 5 (`ModelProvider`/`LlamaCppProvider` implementation):
+generate and check a second credential, scoped to the backend only. Closes the gap where any local
+process could otherwise drive the model runtime directly — triggering inference, consuming
+resources, or (if the runtime ever gains a way to read back arbitrary context) observing
+evidence-derived prompt content — without ever touching FastAPI's own auth. See `MODEL_RUNTIME.md`
+§10, `SECURITY.md` T-23.
+
+---
+
+## D-018: Fail-closed service-identity verification before sending credentials or evidence
+
+**Status:** Accepted
+
+**Context:** D-009 authenticates *callers* of the local FastAPI service. It does not authenticate
+the *service* to the frontend. `ARCHITECTURE.md` §4 and `OPEN_QUESTIONS.md` A-1 already flagged
+port allocation as an open, security-adjacent decision; a second-round review connected that open
+question to a concrete risk: if the chosen local port is occupied by an unrelated or malicious
+process (a race between "pick a free port" and "bind it"), or a fake service is listening on it,
+Tauri could send that process the frontend's bearer token, and subsequently route evidence to it —
+with the frontend having no way to tell the difference from the legitimate service.
+
+**Decision:** Startup requires a fail-closed handshake that verifies the receiving process's
+identity before any credential or evidence is sent to the HTTP endpoint:
+
+1. Tauri launches the exact bundled service executable it shipped (not a path resolved by PATH
+   lookup or any mechanism an unrelated program could intercept), and supplies a one-time startup
+   secret through a private channel the child inherits at spawn (e.g. an inherited pipe/handle, or
+   an environment variable read once at process start and not otherwise exposed) — this startup
+   secret is separate from, and a precursor to, the D-009 session token.
+2. The child binds a loopback port using OS-assigned port allocation (bind to port 0 and let the OS
+   choose and atomically reserve an available port), avoiding the separate "find a free port, then
+   bind it later" race entirely.
+3. The child reports the port it actually bound back to Tauri over the same private channel — never
+   by, e.g., writing it somewhere another process could also observe or race to claim.
+4. Tauri issues a fresh challenge over the now-known HTTP endpoint and verifies the response is
+   correctly computed from the startup secret from step 1 — proving the process answering on that
+   port is the one Tauri spawned — without ever transmitting the startup secret itself over that
+   HTTP channel.
+5. Only once verification succeeds does Tauri expose the verified endpoint and issue the D-009
+   session token to the frontend. If the child exits, fails to bind, fails to respond within a
+   bounded timeout, or fails challenge verification, startup fails closed: no endpoint or token is
+   exposed to the frontend, and Tauri does not fall back to connecting to whatever else may be
+   listening on any port.
+6. Restarting the child (including a user-triggered model/service restart) generates a new startup
+   secret and a new session token; a token issued to a prior child instance is not honored by a
+   newly spawned one.
+
+**Consequences:** Extends S1-04's process-supervision ticket with the handshake logic (steps 1–4)
+and S1-09's packaged-build spike should exercise it, not just the plain health check. No new
+external dependency — this is local process/IPC logic. Directly closes the scenario where an
+occupied port or an impersonating process could obtain the frontend's credential or receive
+evidence intended for the real service. See `ARCHITECTURE.md` §4, `SPRINT_1_BACKLOG.md` S1-04.
+
+---
+
+## D-019: Coverage is reported as independent factual signals, not an automatic "sufficiency" judgment
+
+**Status:** Accepted
+
+**Context:** The "Evidence Sufficiency" concept introduced in the prior review round computed a
+control as "sufficiently covered" from a single approved `SUPPORTS` mapping, and treated
+`PARTIALLY_SUPPORTS`-only coverage as fully resolved ("partially covered," removed from the gap
+list). A second-round review correctly identified this as an automatic judgment the product
+principles explicitly forbid the system from making on its own (`PRODUCT.md` principle 3,
+`COMPLIANCE_MODEL.md` §4: only a human analyst decision is authoritative) — approving one mapping
+confirms that *one relationship*, not that the *whole control* is adequately addressed, and
+collapsing partial evidence into "resolved" hides genuinely incomplete coverage from the gap view
+the product's core value proposition depends on.
+
+**Decision:** Remove "Evidence Sufficiency" as a computed judgment. Replace it with independent,
+simultaneously-possible factual signals per control, none of which is itself a sufficiency
+determination:
+
+| Signal | Meaning |
+|---|---|
+| Support present | At least one current, approved `SUPPORTS` mapping exists. |
+| Partial support present | At least one current, approved `PARTIALLY_SUPPORTS` mapping exists. |
+| Confirmed conflict | At least one current, approved `CONFLICTS_WITH` mapping exists. |
+| References only | At least one current, approved `REFERENCES` mapping exists, and neither of the two signals above is true. |
+| Review pending | At least one relevant Mapping Candidate is still `needs_review` (no Analyst Decision has been made, or it was reopened for review). |
+| Analysis incomplete | Analysis relevant to this control failed, is still pending, or only partially completed (`DECISIONS.md` D-020) — this signal means "don't trust an apparent absence of evidence yet," not "no evidence." |
+
+These are not mutually exclusive: a control can show both "Support present" and "Confirmed
+conflict" at once, and the UI must show both rather than collapsing them into one verdict. The
+**coverage-gap view** (`COMPLIANCE_MODEL.md` §2 "Finding / Gap") is a control **without** "Support
+present" — this includes controls with only "Partial support present," which stays visible as
+unresolved, not removed from the gap view the way D-014's original wording (approved
+`PARTIALLY_SUPPORTS` = coverage) allowed. If a future feature needs an actual, holistic
+"this control is adequately addressed" determination, it must be an explicit, rationale-carrying
+human decision with its own history (like an Analyst Decision), never a computed default.
+
+**Consequences:** `COMPLIANCE_MODEL.md`'s "Evidence Sufficiency" section is replaced with this
+signal table. Gap computation (`DECISIONS.md` D-006/D-014) changes: partial-only controls remain in
+the gap/coverage-gap view rather than being reported as resolved. `OPEN_QUESTIONS.md` U-7 is
+narrowed accordingly (see that entry).
+
+---
+
+## D-020: AnalysisRun gains explicit execution-progress states and persisted per-section outcomes
+
+**Status:** Accepted
+
+**Context:** D-012's original `status` enum (`succeeded` / `succeeded_no_mappings` / `failed` /
+`superseded`) let a run with many failed section evaluations and one trivially successful one
+report as "succeeded" or "succeeded_no_mappings" — indistinguishable from a run that genuinely
+examined everything and found nothing. That silently converts unexamined evidence into an apparent
+absence-of-evidence conclusion, which is exactly the kind of overconfident automatic claim this
+project's principles reject.
+
+**Decision:** `AnalysisRun.status` becomes a pure execution-progress enum: `queued` → `running` →
+one of `succeeded` / `partially_succeeded` / `failed` / `cancelled` / `interrupted`.
+`succeeded_no_mappings` is removed as a status value — "zero mappings produced" is now a fact about
+*output*, entirely orthogonal to execution status (a `succeeded` run can produce zero mappings; a
+`partially_succeeded` run can also produce zero mappings, and the two must not be confused). A new
+`analysis_run_section_result` record is persisted per (run, artifact section) with: the section's
+evaluation outcome (`no_candidates_retrieved` / `evaluated_no_mappings` / `evaluated_with_mappings`
+/ `failed`), a sanitized failure category where applicable (no evidence content, per `SECURITY.md`
+T-10), attempt count, and timestamps. `AnalysisRun.status` is derived from these per-section
+results: `succeeded` if every attempted section reached a non-`failed` outcome; `partially_succeeded`
+if at least one section succeeded and at least one failed; `failed` if every attempted section
+failed (or a fatal run-level error occurred before any section was processed, e.g. the model was
+unavailable at run start); `cancelled` for an explicit stop; `interrupted` for a run left in
+`running` state across an app restart, detected and relabeled rather than left ambiguously
+"running" forever.
+
+**Consequences:** One additional table (`analysis_run_section_result`) and a revised
+`analysis_run.status` enum (Sprint 8 migration, alongside `analysis_run` and `mapping_candidate`
+themselves — no existing migration is altered). `AI_PIPELINE.md` §11's failure-handling table is
+rewritten around per-section outcomes rather than a single all-or-nothing run verdict. This is also
+what "Analysis incomplete" in D-019's signal table is grounded in.
+
+---
+
+## D-021: Supersession is a relationship between runs, not an execution-outcome value; old approvals are retained, not silently revoked
+
+**Status:** Accepted
+
+**Context:** D-012 originally used `superseded` as one value of `AnalysisRun.status`, which
+conflated "this run's *execution* outcome" with "a later run has replaced this one for current-
+coverage purposes" — two different facts that can vary independently (a successful run can later be
+superseded; a failed rerun should not retroactively make an earlier successful run's results
+disappear). It also left unspecified whether older approved mappings still count toward current
+coverage after a rerun, and whether a failed rerun could inadvertently erase a previously working
+analysis.
+
+**Decision:**
+- `AnalysisRun` permanently retains its own execution outcome (D-020) — it is never rewritten to
+  `superseded` or anything else after completion.
+- Supersession is a separate, explicit relationship: `AnalysisRun.superseded_by_analysis_run_id`
+  (nullable, self-referencing), set only when a later run is intended to replace an earlier one for
+  current-coverage purposes. Creating a new `AnalysisRun` does **not** automatically set this on the
+  most recent prior run — it is set deliberately (e.g. once the new run reaches a `succeeded` or
+  `partially_succeeded` outcome), not merely because a rerun was *started*.
+- A **failed or cancelled** replacement run does not supersede anything: the previous run's results
+  remain the current basis for coverage, untouched. The default V0.1 policy for a
+  **partially-succeeded** replacement is that it also does **not** automatically supersede the
+  prior complete run — an explicit analyst or system action is required to treat a partial rerun as
+  the new basis for coverage, rather than silently downgrading previously-complete results.
+- Mapping Candidates and their Analyst Decisions from a superseded run are **not deleted or
+  hidden**, and their approvals are **not automatically transferred** to any new candidate a rerun
+  produces — a new candidate always starts `needs_review` regardless of what was approved on an
+  earlier run's analogous suggestion. Current coverage (`DECISIONS.md` D-019) continues to count an
+  older approved mapping even if its originating run has since been superseded, but the review UI
+  must visibly flag such a mapping as based on a superseded analysis run ("older analysis"),
+  pending the analyst either re-confirming, replacing, or withdrawing that decision — coverage is
+  not silently revoked out from under an assessment just because a newer run exists.
+
+**Consequences:** `analysis_run.superseded_by_analysis_run_id` added to the schema
+(`DATABASE.md`). Coverage/gap queries join through current Analyst Decisions as before (D-005/D-019)
+and are unaffected by which run produced the underlying candidate, except for the added "older
+analysis" UI flag. Prevents two failure modes: (a) a failed rerun silently erasing previously-good
+coverage, and (b) duplicate/regenerated candidates being treated as independent additional evidence
+rather than a re-assessment of the same relationship.
+
+---
+
+## D-022: Parser containment is defined by required permission properties, not by process count
+
+**Status:** Accepted
+
+**Context:** D-010 correctly moved the *timing* of the parser containment decision to Sprint 4, but
+its consequences text said "a size/time-limited subprocess-per-parse ... is sufficient." A
+second-round review correctly identified that a plain subprocess with inherited filesystem/network/
+credential access does not stop code exploited via a malicious PDF/DOCX/CSV from reading other
+evidence, opening the database, exfiltrating over the network, or reading the D-009/D-017
+credentials — process separation alone bounds *availability* (a hung/crashed parser doesn't take
+down the whole service) but not *confidentiality/integrity* under active exploitation, which is the
+threat T-01/T-02/T-03 actually describe.
+
+**Decision:** The parser containment boundary decided in Sprint 4 (per D-010's timing) must provide,
+regardless of the specific mechanism chosen:
+
+- Read access limited to the specific input file being parsed (and any explicitly-provided
+  reference data, e.g. a shared decompression-limit config) — not the rest of the evidence store.
+- Write access limited to a dedicated scratch location, not the application's data directory,
+  database file, or other evidence.
+- No access to the assessment database, other artifacts, or any authentication credential
+  (D-009/D-017) — these must not be inherited into the parser worker's environment/handles at all.
+- No network access.
+- Enforced bounds on memory, CPU time, wall-clock time, expanded-archive size (T-02/T-03), and
+  output size.
+- No unintended inherited handles, environment variables, or secrets beyond what parsing strictly
+  requires.
+- The trusted service (FastAPI) validates the worker's bounded output before persisting any of it —
+  the worker's output is still untrusted data, not a trusted result merely because it came from a
+  contained process.
+
+The specific Windows isolation mechanism (e.g. a restricted job object plus a low-integrity/
+low-privilege token, a dedicated unprivileged service account, or another mechanism providing the
+same properties) is still the product owner's call (`OPEN_QUESTIONS.md` S-1) and must be selected
+and demonstrated to provide these properties *before* real evidence is connected to it, not assumed
+from "it's a subprocess."
+
+**Consequences:** Sprint 4's exit criteria gain a concrete containment test requirement: a test
+worker that deliberately attempts to read unrelated evidence, open the database, make a network
+call, or exceed a resource bound must be observably denied or terminated — tests must verify
+containment, not merely that legitimate parsing still succeeds. This is a larger Sprint 4 scope
+than "wrap the parser in a subprocess," proportional to the actual threat.
+
+---
+
+## D-023: Generation/embedding split is completed end-to-end — health checks, hardware budgeting, and provenance
+
+**Status:** Accepted
+
+**Context:** D-011 split the `ModelProvider` interface into `GenerationCapable`/`EmbeddingCapable`,
+but left several dependent contracts pointed at the old single-model assumption: `health_check()`
+was still specified as "capable of serving a minimal generation request" even for an embedding-only
+provider; hardware recommendation logic (`MODEL_RUNTIME.md` §5) did not account for both
+capabilities' models being resident in memory at once; and `AnalysisRun` provenance
+(`DECISIONS.md` D-013) recorded only one model identity, with no place for the embedding model's own
+identity or index configuration.
+
+**Decision:**
+- `GenerationCapable.health_check()` performs a minimal, bounded real generation call and confirms
+  a well-formed response; `EmbeddingCapable.health_check()` embeds a fixed short string and confirms
+  the returned vector is finite (no NaN/Inf) and matches the expected dimensionality for that model
+  — an embedding-only provider must never be health-checked via a generation call it doesn't
+  support.
+- Model catalog entries (`MODEL_RUNTIME.md` §3) declare a `roles` field (`["generation"]`,
+  `["embedding"]`, or both), and capability-specific fields apply only to the relevant role(s) (e.g.
+  `context_window` for generation; embedding dimensionality/normalization for embedding).
+- Hardware feasibility (`MODEL_RUNTIME.md` §5) must budget the **combined** memory/VRAM footprint
+  when a generation model and a separate embedding model are configured to run simultaneously; if
+  the combined footprint doesn't fit the detected hardware, the app supports **sequential loading**
+  (load the embedding model during indexing/retrieval phases, swap to the generation model for
+  evaluation phases) as a documented, supported path — never a silent degradation or an
+  unexplained crash.
+- `AnalysisRun` provenance (D-013) records the embedding model's identity separately from the
+  generation model's: `embedding_model_identifier`, `embedding_model_version`,
+  `embedding_model_digest`, plus `embedding_dimensions`, `embedding_normalization`, and an
+  `embedding_config_version` (or digest covering model + preprocessing + normalization).
+- Whenever the embedding configuration changes, any previously computed embedding index is treated
+  as **incompatible** and must be rebuilt (or retrieval is clearly marked degraded until it is) —
+  vectors produced under different embedding configurations must never be compared to each other.
+
+**Consequences:** `MODEL_RUNTIME.md` §3/§5/§9, `DATABASE.md`'s `analysis_run` fields, and
+`SPRINTS.md` Sprints 5/6/8 are updated. This is what makes an embedding-only provider actually
+health-checkable, keeps hardware recommendations honest about running two models, and prevents a
+silent retrieval-quality bug from comparing embeddings produced under two different
+model/preprocessing configurations.
+
+---
+
+## D-024: Deterministic, revision-based analyst decision ordering, plus explicit referential-integrity invariants
+
+**Status:** Accepted
+
+**Context:** D-005 established append-only Analyst Decisions with "current status = latest
+`decided_at`," and the schema otherwise relied on individual foreign keys without stating several
+cross-table invariants explicitly. A second-round review correctly noted: (a) wall-clock timestamps
+can collide or move backward (system clock changes, coarse timestamp resolution under concurrent
+writes), making "latest by `decided_at`" ambiguous; (b) `decided_by` was left as an unspecified
+"local user identity" without stating its (lack of) assurance; (c) several referential-integrity
+rules that matter for correctness were implied but never stated as explicit requirements, alongside
+a genuinely disconnected join-table in the ER diagram and an invalid-JSON example.
+
+**Decision:**
+- Every `Analyst Decision` write is assigned a monotonically increasing, per-`mapping_candidate_id`
+  `revision` integer inside the same transaction as the insert, with a uniqueness constraint on
+  (`mapping_candidate_id`, `revision`). "Current status" is determined by highest `revision`, never
+  by `decided_at`. `decided_at` is retained as descriptive audit metadata (when it happened), not as
+  the ordering key.
+- Writing a new decision requires the caller to state the revision it expects to be extending
+  (optimistic concurrency); a write against a stale expected-revision is rejected, so two
+  concurrent decision submissions on the same candidate cannot silently clobber each other.
+- `decided_by` is a stable local analyst identifier, explicitly documented as a **local, unverified
+  identity** in V0.1 (single-user, no authentication of "who is at the keyboard") — its assurance
+  level must not be overstated in any UI or export copy (e.g. never presented as a verified
+  signature).
+- The following referential-integrity invariants are explicit requirements (enforced by database
+  constraints where SQLite practically allows, otherwise centralized in transactional write paths
+  and covered by tests — not left as an unstated assumption):
+  1. Every `artifact_section_id` cited via `mapping_candidate_section` belongs to the same
+     `artifact_id` as the `mapping_candidate` doing the citing.
+  2. When `source = 'ai'`, the `mapping_candidate.analysis_run_id`'s `artifact_id` matches the
+     `mapping_candidate`'s own `artifact_id`.
+  3. `mapping_candidate.control_id` belongs to the assessment's framework (`COMPLIANCE_MODEL.md`
+     §8 item 2, restated here as a concrete constraint requirement).
+  4. `mapping_candidate.enhancement_id`, when set, belongs to `mapping_candidate.control_id`.
+  5. `assessment_control_scope` entries belong to the assessment's own framework.
+  6. (`mapping_candidate_id`, `artifact_section_id`) pairs in `mapping_candidate_section` are
+     unique (no duplicate citation of the same section by the same candidate).
+- SQLite foreign keys (`PRAGMA foreign_keys = ON`) are enforced on every connection, not assumed
+  enabled by default.
+- The ER diagram's `MAPPING_CANDIDATE_SECTION` join table gains explicit relationship edges to both
+  `MAPPING_CANDIDATE` and `ARTIFACT_SECTION` (it was previously described only in prose, not drawn
+  as a relationship in the diagram itself). The Model Catalog JSON example's
+  `"size_bytes": 4_500_000_000` (numeric underscore separators are not valid JSON) is corrected to a
+  plain integer.
+- Existing claims that individual foreign keys alone "make cross-assessment contamination a
+  constraint violation" are narrowed: a direct FK (e.g. `artifact.assessment_id` →
+  `assessment.id`) prevents an artifact from referencing a nonexistent/wrong assessment row, but
+  does **not** by itself prevent a join-table row (like `mapping_candidate_section`) from citing a
+  section belonging to a *different* artifact/assessment than the mapping candidate itself — that
+  requires the explicit invariants above, not an assumption that individual FKs compose into full
+  isolation.
+
+**Consequences:** `analyst_decision` gains a `revision` column and its uniqueness constraint;
+`DATABASE.md` §5 gains the explicit invariant list; the ER diagram and JSON example are corrected.
+No change to the product-visible decision workflow — this is entirely a correctness/audit-integrity
+fix underneath it.
 
 ---
 
