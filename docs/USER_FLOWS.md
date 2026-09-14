@@ -62,7 +62,10 @@ cloned/templated.
    silently re-processed.
 3. Files undergo the security handling described in `SECURITY.md` (size limits, type
    verification, sandboxed parsing) before any content is extracted.
-4. User sees per-file ingestion status: queued → parsing → parsed / failed.
+4. User sees per-file ingestion status: queued → parsing → one of `parsed` / `partial` / `empty` /
+   `unsupported_format` / `failed` (`DATABASE.md` §3) — not just a binary parsed/failed, so a
+   scanned-image PDF with no extractable text or a partially-recovered document is visible as its
+   own distinct state, not lumped in with either success or failure.
 
 Open questions: max file size and count limits for V0.1; whether folder-based bulk upload is
 required; how near-duplicate (not byte-identical) evidence is surfaced, if at all, in V0.1.
@@ -118,10 +121,12 @@ vs. thousands of nodes); whether graph state (layout, filters) persists per asse
 
 ## 11. Gap Review
 
-1. User sees a list of controls with no supporting evidence, or only low-confidence/rejected
-   evidence, within the assessment's scope.
-2. Gap severity/categorization logic (missing vs. weak vs. stale vs. conflicting) is defined in
-   `COMPLIANCE_MODEL.md`.
+1. User sees a list of controls with no `approved` `SUPPORTS`/`PARTIALLY_SUPPORTS` mapping, within
+   the assessment's scope (`COMPLIANCE_MODEL.md` §2 "Finding / Gap" — an approved `CONFLICTS_WITH`
+   or `REFERENCES` mapping never counts as coverage, so a control with only those is still a gap).
+2. A confirmed `CONFLICTS_WITH` mapping is surfaced as its own signal alongside the gap view (not a
+   gap-severity sub-category) — it means something different (evidence appears to contradict the
+   control) than an absence of evidence.
 
 Open questions: whether gap analysis considers control baseline/applicability, or naively expects
 every control in the framework to have evidence.

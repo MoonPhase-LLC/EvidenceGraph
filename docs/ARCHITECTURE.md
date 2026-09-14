@@ -65,30 +65,44 @@ flowchart LR
         U3["LLM output"]
     end
     subgraph TB1["Trust boundary: file ingestion"]
-        Parser["Sandboxed parsers"]
+        Parser["Contained parsers\n(subprocess, size/time-limited)"]
     end
     subgraph TB2["Trust boundary: model output"]
         Validator["Deterministic schema validation"]
     end
+    subgraph TB3["Trust boundary: evidence rendering"]
+        Render["WebView rendering\n(escaped/inert text only)"]
+    end
     U1 --> Parser --> App["Application logic"]
     U2 -->|"checksum/signature check"| Runtime["Model runtime"]
     Runtime --> U3 --> Validator --> App
+    App --> Render --> FE["Frontend display"]
 ```
 
-Two boundaries matter most:
+Three boundaries matter most:
 
 1. **File ingestion boundary**: every uploaded file is untrusted bytes until parsed by a
-   size-limited, type-verified, sandboxed-as-practical parser. Extracted text is still treated as
-   *data*, never as instructions, downstream (see `SECURITY.md`).
+   size-limited, type-verified, contained parser. The containment mechanism (subprocess isolation
+   vs. hard in-process resource limits vs. WASM sandbox) is decided and implemented in Sprint 4, not
+   deferred to later hardening (`DECISIONS.md` D-010) — Sprint 13 then verifies/hardens it
+   adversarially. Extracted text is still treated as *data*, never as instructions, downstream (see
+   `SECURITY.md`).
 2. **Model output boundary**: LLM output is untrusted/probabilistic. It must pass deterministic
    schema validation before being persisted as a Mapping Candidate. A model that returns malformed
    JSON, an unknown control ID, or an out-of-range confidence is rejected, not "best-effort
    parsed."
+3. **Evidence rendering boundary**: evidence text, section citations, and model-generated reasoning
+   summaries are untrusted content reaching a real browser-engine rendering context (the Tauri
+   WebView). They must be rendered as inert/escaped text, never raw HTML or interpreted Markdown,
+   unless a future feature explicitly adds a sanitized rich-rendering path. See `SECURITY.md` T-21.
 
 Process boundary: the frontend (Tauri/React) never directly parses evidence, never directly talks
 to the model runtime, and never directly touches the database. Everything evidence-related goes
 through the local analysis service, which is the only component with filesystem/database/model
 access beyond what the OS file picker exposes to the frontend for selecting files to upload.
+This boundary is also where authentication applies (§4): the local service must reject any caller
+that doesn't present the current session's shared-secret token, regardless of which local process
+is calling.
 
 ## 4. Desktop / Frontend / Backend Interaction
 
@@ -97,6 +111,12 @@ access beyond what the OS file picker exposes to the frontend for selecting file
 - Frontend communicates with the service over HTTP restricted to `127.0.0.1` on a locally
   allocated port (not a fixed well-known port, to reduce collision/hijack risk — open question,
   see `DECISIONS.md`).
+- Localhost binding restricts *network* reachability but is not authentication (`SECURITY.md`
+  T-09): the Tauri host generates a random shared-secret token at each app launch, passes it to the
+  FastAPI child process via environment variable and to the frontend via Tauri's own IPC channel,
+  and every local-service request must carry that token. This is a lightweight, session-scoped
+  mechanism — not a user login/credential system — sized to close the "any other local process can
+  call the API" gap without adding real auth infrastructure. See `DECISIONS.md` D-009.
 - No remote network calls originate from the local analysis service in V0.1 except: (a) model
   catalog fetch/download, which is an explicit, visible, user-initiated network action, never
   silent.
@@ -110,10 +130,12 @@ implementation detail the frontend never depends on directly.
 
 ## 6. Model Runtime
 
-See `MODEL_RUNTIME.md` for detail. Architecturally: the AI pipeline depends only on a
-`ModelProvider` interface (roughly: `generate(prompt, schema) -> structured_output`,
-`health_check()`, `list_available()`), not on llama.cpp specifics. V0.1 ships exactly one
-implementation, `LlamaCppProvider`, run as a local subprocess/server bound to localhost.
+See `MODEL_RUNTIME.md` for detail. Architecturally: the AI pipeline depends only on capability
+interfaces — `GenerationCapable` (`generate(prompt, schema) -> structured_output`) and
+`EmbeddingCapable` (`embed(text) -> vector`) — not on llama.cpp specifics, and not on the
+assumption that one model must serve both roles (`DECISIONS.md` D-011). V0.1 ships exactly one
+provider implementation, `LlamaCppProvider`, which may back either or both capabilities, run as a
+local subprocess/server bound to localhost.
 
 ## 7. Document Pipeline
 
@@ -130,6 +152,13 @@ walks Framework → Family → Control → Enhancement, resolves candidate contr
 control detail must work for any framework conforming to the (yet-to-be-finalized-in-detail)
 framework data format — it must not special-case NIST identifiers (e.g. must not assume all
 control IDs match `^[A-Z]{2}-\d+$`, since future frameworks will not share that shape).
+
+Family is **optional**, not required: a Control may belong to a Control Family or attach directly
+to its Framework (`DECISIONS.md` D-016). Requiring every framework to have a family-level grouping
+would itself be a NIST-shaped assumption baked into the schema, even though NIST 800-53 Rev. 5 does
+use families. Full arbitrary-depth nested grouping is explicitly not attempted in V0.1 — see
+`OPEN_QUESTIONS.md` A-5 — this is a proportional fix (optional single grouping level), not a
+generalized hierarchy engine.
 
 ## 9. AI Pipeline (Summary)
 

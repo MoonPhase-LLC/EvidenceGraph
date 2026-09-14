@@ -4,17 +4,31 @@ Status: Sprint 0 draft.
 
 ## 1. `ModelProvider` Abstraction
 
-The AI pipeline (`AI_PIPELINE.md`) depends only on this interface, never on a specific runtime:
+The AI pipeline (`AI_PIPELINE.md`) depends only on capability interfaces, never on a specific
+runtime, and never on the assumption that one model instance must serve every capability
+(`DECISIONS.md` D-011 — this revises the original single-interface sketch, which bundled
+generation and embedding together as if one loaded model always does both):
 
 ```
-ModelProvider:
+GenerationCapable:
   generate(prompt: str, schema: JSONSchema, timeout_s: float) -> StructuredResult | ProviderError
-  embed(text: str) -> list[float]                      # for retrieval, §AI_PIPELINE.md §5
   health_check() -> HealthStatus                        # up/down, model loaded, version info
   describe() -> ModelDescriptor                          # id, version, context window, capabilities
+
+EmbeddingCapable:
+  embed(text: str) -> list[float]                      # for retrieval, §AI_PIPELINE.md §5
+  health_check() -> HealthStatus
+  describe() -> ModelDescriptor
 ```
 
-V0.1 ships exactly one implementation: `LlamaCppProvider`. The interface exists so that
+A concrete provider (e.g. `LlamaCppProvider`) may implement one or both interfaces. The pipeline
+asks for "the active generation provider" and "the active embedding provider" independently — they
+may be the same underlying process/model if a chosen GGUF model is adequate at both, or two
+separate `LlamaCppProvider` instances loaded with different models, whichever gives acceptable
+retrieval and generation quality (an empirical Sprint 5/6 decision, informed by an early
+retrieval-quality check — see `SPRINTS.md` Sprint 8).
+
+V0.1 ships exactly one provider implementation: `LlamaCppProvider`. The interface exists so that
 `OllamaProvider`, `VLLMProvider`, or an `EnterprisePrivateProvider` could be added later without
 touching pipeline code — not because V0.1 needs more than one.
 
@@ -106,14 +120,19 @@ not verified by the app, distinct from a catalog download.
 
 ## 8. Model Start / Stop / Switching
 
-- Start: launch `LlamaCppProvider` subprocess for the selected model; confirm via `health_check()`
-  before the pipeline is allowed to use it.
-- Stop: on app exit, and when the user explicitly switches models (stop current before starting
-  next — avoid two model processes competing for the same hardware resources simultaneously in
-  V0.1; running multiple models concurrently is not a V0.1 requirement).
-- Switching: requires stopping the current provider instance and starting a new one; in-flight
-  pipeline work should be allowed to fail cleanly rather than silently pointing at the new model
-  mid-evaluation.
+- Start: launch `LlamaCppProvider` subprocess(es) for the selected generation and/or embedding
+  model; confirm via `health_check()` before the pipeline is allowed to use each.
+- Single active model **per capability** at a time (`DECISIONS.md` D-011, narrowing the original
+  D-008 "single active model" statement): at most one generation provider and at most one embedding
+  provider are running simultaneously — not one model process total. If the same model backs both
+  capabilities, that's one process; if not, it's two. Either way, V0.1 does not run a fleet of
+  concurrently-serving models, and switching the generation model does not require restarting the
+  embedding model (or vice versa).
+- Stop: on app exit, and when the user explicitly switches a model for a given capability (stop
+  that capability's current provider before starting its replacement).
+- Switching: requires stopping the current provider instance for that capability and starting a
+  new one; in-flight pipeline work should be allowed to fail cleanly rather than silently pointing
+  at the new model mid-evaluation.
 
 ## 9. Health Checking
 
@@ -125,7 +144,11 @@ Used at: model start confirmation, and optionally a periodic/on-demand check sur
 
 The llama.cpp server (if run in server mode) must bind to `127.0.0.1` only, exactly like the
 FastAPI service (`SECURITY.md` T-09). No LAN or public interface binding in V0.1 under any
-configuration.
+configuration. Localhost binding is a network-reachability control, not authentication — the
+llama.cpp server is only ever called by the FastAPI service (never directly by the frontend), so it
+inherits the FastAPI service's own boundary rather than needing its own shared-secret token; the
+requirement is that nothing outside the FastAPI service process can reach it, which localhost
+binding alone accomplishes here since it has exactly one intended caller.
 
 ## 11. Offline Mode
 

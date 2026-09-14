@@ -73,6 +73,10 @@ independently runnable project.
   `docs/ARCHITECTURE.md` §4 open question on port allocation; for this ticket, an env-var or
   CLI-arg-configurable port with a documented default is sufficient, final allocation strategy
   can follow in S1-04/later.
+- Auth-check middleware: every request (except perhaps `/health` itself, for simple liveness
+  probing — product owner's call) must carry a shared-secret token matching an env-var the process
+  was launched with; mismatched/missing token → 401. The token itself is generated and propagated
+  by S1-04 — this ticket just needs to enforce it once present (`docs/DECISIONS.md` D-009).
 - Python dependency management set up (e.g. `pyproject.toml`).
 
 **Non-goals:** No database, no real business logic endpoints yet.
@@ -80,9 +84,11 @@ independently runnable project.
 **Dependencies:** S1-01.
 
 **Acceptance criteria:** `GET http://127.0.0.1:<port>/health` returns a 200 with a status payload
-when run standalone (without Tauri).
+when run standalone (without Tauri) and a valid token env var set; a request with a missing/wrong
+token to an auth-required endpoint returns 401.
 
-**Required tests:** A test hitting `/health` and asserting the response shape.
+**Required tests:** A test hitting `/health` and asserting the response shape; a test asserting the
+401 behavior on a missing/invalid token.
 
 ---
 
@@ -98,10 +104,14 @@ process-lifecycle implications
 - On app start, Tauri launches the FastAPI service as a child process.
 - Tauri determines/passes the port the service should bind to (resolving the S1-03 open
   question — e.g. Tauri picks an available local port and passes it via env var/arg).
+- Tauri generates a random per-launch shared-secret token and passes it to the FastAPI child
+  process via environment variable (never a CLI argument), and separately exposes the same token to
+  the frontend via Tauri's own IPC (not over the local HTTP channel) so the frontend can attach it
+  to every request (`docs/DECISIONS.md` D-009). The token lives only in memory for the session.
 - On app exit (including abnormal exit paths where feasible), the child process is terminated —
   no orphaned Python processes left running.
-- Frontend can successfully call the `/health` endpoint through this supervised process and
-  display the result on the placeholder screen from S1-02.
+- Frontend can successfully call the `/health` endpoint through this supervised, authenticated
+  process and display the result on the placeholder screen from S1-02.
 
 **Non-goals:** No production-grade process supervision (auto-restart on crash, etc.) — that can
 be a later hardening ticket if needed.
@@ -221,3 +231,44 @@ whichever agent completes S1-04
 `DECISIONS.md`) that Sprint 1's exit criteria are met.
 
 **Required tests:** N/A.
+
+---
+
+### S1-09: Packaged-build spike (clean-machine validation)
+
+**Objective:** Validate the actual top technical risk from `docs/DECISIONS.md` D-001 — bundling a
+Python runtime inside a Tauri app for distribution — as an early, narrow spike, rather than
+discovering packaging problems for the first time in Sprint 16 after fifteen sprints of feature
+work have been built on an unvalidated assumption. This is deliberately **not** full packaging/
+installer work (that stays Sprint 16); it is a minimal end-to-end proof.
+
+**Implementation owner recommendation:** Claude Code (Tauri bundler config), with Codex advising on
+Python runtime bundling options (PyInstaller/embedded interpreter/etc.)
+
+**Requirements:**
+- Run the Tauri bundler to produce an installable Windows package (e.g. an MSI/NSIS installer) that
+  embeds or bundles the Python FastAPI service in some form — the exact bundling approach
+  (PyInstaller-frozen executable, embedded Python distribution, etc.) is this ticket's own decision
+  to make and document, not assumed in advance.
+- Install and launch that package on a Windows machine **without** the development toolchain
+  installed (no system Python, no Node, no Rust toolchain present) — a real proxy for "a customer's
+  machine," not another dev environment.
+- Confirm the packaged app launches, spawns the bundled service, and completes one authenticated
+  health-check round-trip (reusing S1-04's mechanism), then shuts down cleanly with no orphaned
+  processes.
+- Record the outcome — clean pass, or specific blocking issues found — in `docs/DECISIONS.md`
+  D-001, updating it from "flagged as a risk" to either "validated early" or "needs a follow-up
+  mitigation ticket before Sprint 16," with concrete detail either way.
+
+**Non-goals:** No auto-update mechanism, no code signing, no installer UX polish, no support for
+non-Windows platforms — all Sprint 16 concerns. This ticket only needs to prove the bundling
+mechanism *can* work, not make it production-ready.
+
+**Dependencies:** S1-02, S1-03, S1-04.
+
+**Acceptance criteria:** A built installer package launches and passes the health-check round-trip
+on a clean Windows machine; `docs/DECISIONS.md` D-001 is updated with the concrete outcome.
+
+**Required tests:** Manual verification on a clean machine (VM snapshot without dev tooling is
+acceptable), documented in the PR description — this is inherently a packaging/environment
+validation, not something meaningfully unit-testable.

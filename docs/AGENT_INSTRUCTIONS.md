@@ -32,7 +32,7 @@ root `CLAUDE.md`, which these rules are consistent with and expand on.
 ## 3. Data and Schema
 
 8. Do not change database schemas without migrations once implementation begins (no ad hoc schema
-   edits against a running local database — see `DATABASE.md` §5).
+   edits against a running local database — see `DATABASE.md` §6).
 9. Do not modify compliance framework data (`/frameworks/**`) unless explicitly tasked to do so.
 10. Never fabricate or invent official NIST (or any framework's) control language. If official
     framework data isn't present yet, do not synthesize plausible-looking substitutes — leave the
@@ -48,7 +48,10 @@ root `CLAUDE.md`, which these rules are consistent with and expand on.
 13. Never bind a local service (the FastAPI service, the model runtime) to anything other than
     `127.0.0.1` unless a task explicitly and specifically requires otherwise — and if it ever
     does, that's an architecture-level decision requiring product-owner approval first, not a
-    routine implementation choice.
+    routine implementation choice. Localhost binding is a network-reachability control, not
+    authentication (`docs/SECURITY.md` T-09) — the FastAPI service must also enforce the per-launch
+    shared-secret token from `docs/DECISIONS.md` D-009 on every request; do not remove or bypass
+    that check under the assumption that localhost binding alone is sufficient.
 14. Never place evidence content, extracted text, or prompts containing evidence into logs. Logs
     may contain structural metadata (file hash, size, status, error class) only. See
     `docs/SECURITY.md` T-10.

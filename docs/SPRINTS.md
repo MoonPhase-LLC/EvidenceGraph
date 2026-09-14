@@ -46,25 +46,34 @@ code written; open questions documented rather than silently resolved.
 minimal skeleton, before building real features on top of an unvalidated assumption.
 
 **Deliverables:** Tauri app shell that launches; FastAPI local service spawned as a child process,
-bound to localhost; a minimal frontend screen that calls one localhost API endpoint and displays
-the result; basic project tooling (linting, formatting, test runners) wired up for both the
-Rust/TS and Python sides; CI running those checks on PRs.
+bound to localhost and authenticated via the per-launch shared-secret token (`DECISIONS.md` D-009);
+a minimal frontend screen that calls one localhost API endpoint and displays the result; basic
+project tooling (linting, formatting, test runners) wired up for both the Rust/TS and Python sides;
+CI running those checks on PRs; a narrow **packaged-build spike** (see S1-09 in
+`docs/SPRINT_1_BACKLOG.md`) that runs the Tauri bundler to produce an installable package
+embedding the Python service, and launches that package on a clean Windows machine (not just `tauri
+dev`) — distinct from and much smaller than Sprint 16's full packaging/release work, but validating
+the actual riskiest assumption (`DECISIONS.md` D-001) far earlier than "Sprint 16" would otherwise
+allow.
 
 **Claude Code responsibilities:** Tauri shell, React/TS frontend skeleton, repo-wide tooling
-config, CI workflow.
+config, CI workflow, packaged-build spike.
 
-**Codex responsibilities:** FastAPI service skeleton, Python project tooling (linting/typing/test
-runner), backend unit test scaffolding.
+**Codex responsibilities:** FastAPI service skeleton (including the shared-secret auth check),
+Python project tooling (linting/typing/test runner), backend unit test scaffolding.
 
 **Human responsibilities:** Approve the validated Tauri↔FastAPI process-supervision approach
-before Sprint 2 builds on it; resolve the port-allocation open question.
+before Sprint 2 builds on it; resolve the port-allocation open question; confirm the packaged-build
+spike's outcome (clean pass / needs follow-up mitigation) before treating D-001's risk as addressed.
 
 **Dependencies:** Sprint 0 docs.
 
-**Exit criteria:** App launches on Windows; frontend successfully round-trips a call to the local
-service; CI passes on a clean checkout; the Python-runtime-bundling risk flagged in `DECISIONS.md`
-D-001 is either resolved or has a concrete mitigation plan. See `docs/SPRINT_1_BACKLOG.md` for
-tickets.
+**Exit criteria:** App launches on Windows in dev mode; frontend successfully round-trips a call to
+the local service through the authenticated channel; CI passes on a clean checkout; the
+packaged-build spike produces a launchable installed package on a machine without dev tooling, or
+documents a concrete blocking issue and mitigation plan; the Python-runtime-bundling risk flagged in
+`DECISIONS.md` D-001 is either resolved or has a concrete mitigation plan grounded in that spike's
+actual result, not just a dev-mode assumption. See `docs/SPRINT_1_BACKLOG.md` for tickets.
 
 ---
 
@@ -121,23 +130,27 @@ NIST-specific hardcoding (verified by code review against `ARCHITECTURE.md` §8'
 extraction/chunking for PDF/DOCX/TXT/CSV.
 
 **Deliverables:** Upload API/UI; artifact + artifact_section tables and migration; parsers with
-the size/decompression/path-traversal mitigations from `SECURITY.md`; per-file ingestion status
-UI.
+the size/decompression/path-traversal mitigations from `SECURITY.md`; **the parser containment
+boundary itself** (subprocess isolation or equivalent — the specific mechanism per
+`OPEN_QUESTIONS.md` S-1, but decided and implemented here, not deferred — `DECISIONS.md` D-010);
+the full `artifact.parse_status` extraction-outcome taxonomy (`DATABASE.md` §3: `parsed` / `partial`
+/ `empty` / `unsupported_format` / `failed`, not just a binary success/fail); per-file ingestion
+status UI.
 
 **Claude Code responsibilities:** Upload UI, ingestion status UI.
 
-**Codex responsibilities:** Parsers, security hardening (size limits, sandboxing approach per the
-open question in `SECURITY.md`), hashing/duplicate detection, backend tests including adversarial
-file inputs.
+**Codex responsibilities:** Parsers, the containment boundary implementation, hashing/duplicate
+detection, backend tests including adversarial file inputs.
 
-**Human responsibilities:** Approve file size/count limits; approve the parser-sandboxing
-approach.
+**Human responsibilities:** Approve file size/count limits; approve the specific containment
+mechanism (subprocess vs. WASM vs. another approach).
 
 **Dependencies:** Sprint 2.
 
 **Exit criteria:** PDF/DOCX/TXT/CSV upload works; malicious/oversized/malformed test files are
-rejected safely, not crash the app; duplicate files are flagged; no evidence content appears in
-logs.
+rejected safely, not crash the app, and are contained by the boundary decided in this sprint (not a
+placeholder); duplicate files are flagged; every parse outcome maps to one of the defined
+`parse_status` values, not just success/fail; no evidence content appears in logs.
 
 ---
 
@@ -214,21 +227,29 @@ Mapping Candidates, per `docs/AI_PIPELINE.md`.
 
 **Deliverables:** Embedding-based + lexical retrieval; evaluation prompt template with
 injection-resistance measures; structured output schema implementation; deterministic validation;
-`mapping_candidate` (+ join table) migration and persistence.
+`analysis_run` and `mapping_candidate` (+ join table) migrations and persistence
+(`DATABASE.md`); a **small hand-labeled evaluation sample** (a handful of artifacts with
+known-correct mappings, not the full Sprint 14 harness) used to sanity-check retrieval and mapping
+quality before the rest of the review/graph/gap features are built on top of this pipeline.
 
 **Claude Code responsibilities:** Mapping review UI (list/detail, approve/reject/needs-review).
 
 **Codex responsibilities:** Retrieval implementation, LLM evaluation orchestration, schema
-validation, provenance persistence, adversarial testing (prompt injection test fixtures).
+validation, provenance persistence, adversarial testing (prompt injection test fixtures), running
+the small evaluation sample and reporting baseline retrieval/mapping quality.
 
 **Human responsibilities:** Review mapping quality on real/sample evidence; approve retrieval
-tuning (top-N, thresholds).
+tuning (top-N, thresholds); provide or approve the small hand-labeled evaluation sample (a scoped-
+down precursor to Sprint 14's full set, not a replacement for it).
 
 **Dependencies:** Sprints 3, 4, 5, 7.
 
 **Exit criteria:** Running analysis on a test artifact produces schema-valid Mapping Candidates
-with correct provenance; a crafted prompt-injection test document does not alter system behavior
-beyond producing an (still-human-reviewed) mapping candidate.
+with correct provenance, each attributable to an `analysis_run` with full configuration identity
+(`DECISIONS.md` D-013); a crafted prompt-injection test document does not alter system behavior
+beyond producing an (still-human-reviewed) mapping candidate; the small evaluation sample shows
+retrieval/mapping quality is not obviously broken (not a formal precision/recall gate — that's
+Sprint 14) before later sprints build on this pipeline.
 
 ---
 
@@ -321,12 +342,16 @@ baselines, rejected-only mappings, etc.).
 
 ## Sprint 13 — Security Hardening
 
-**Objective:** Close out unresolved items from `docs/SECURITY.md` §6 and run a focused adversarial
-review.
+**Objective:** Close out remaining unresolved items from `docs/SECURITY.md` §6 and run a focused
+adversarial review — including **hardening and adversarially verifying** the parser containment
+boundary that was decided and built in Sprint 4 (`DECISIONS.md` D-010), not deciding or introducing
+that boundary for the first time here.
 
-**Deliverables:** Decisions and implementation for: parser sandboxing approach, at-rest DB
-encryption (yes/no), retention/deletion policy, dependency scanning in CI. Adversarial test suite
-(malicious files, injection attempts, oversized inputs).
+**Deliverables:** Adversarial hardening of the existing Sprint 4 parser containment boundary
+(fuzzing, malicious-file corpus, resource-limit tuning under load); decisions and implementation
+for the remaining open items: at-rest DB encryption (yes/no), retention/deletion policy (including
+WAL/journal/temp-file cleanup per `SECURITY.md` T-22), dependency scanning in CI. Full adversarial
+test suite (malicious files, injection attempts, oversized inputs).
 
 **Claude Code responsibilities:** Implement UI-facing consequences of security decisions (e.g.
 delete confirmations, encryption passphrase UX if adopted).
@@ -348,10 +373,12 @@ deferred with owner sign-off; adversarial test suite passes.
 
 **Objective:** Build a repeatable way to measure mapping quality (precision/recall against a
 hand-labeled set), since V0.1 success is not judged against a benchmark that doesn't yet exist
-(`PRODUCT.md` §8).
+(`PRODUCT.md` §8). This formalizes and extends the small evaluation sample already introduced in
+Sprint 8 — Sprint 8's sample is a sanity check taken early; this sprint builds the durable,
+larger, regression-tracking harness on top of it.
 
-**Deliverables:** Hand-labeled evaluation set (small, human-curated); scoring harness; baseline
-metrics recorded.
+**Deliverables:** Hand-labeled evaluation set (small, human-curated, expanding on Sprint 8's
+sample); scoring harness; baseline metrics recorded.
 
 **Claude Code responsibilities:** Tooling/UI to support labeling if needed.
 

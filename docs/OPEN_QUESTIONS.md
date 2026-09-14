@@ -26,6 +26,15 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
   `SPRINTS.md` Sprint 12)
 - C-3: What is the authoritative source for NIST SP 800-53 Rev. 5 control text to be loaded in
   Sprint 3, and are there licensing/attribution requirements to satisfy? (`SPRINTS.md` Sprint 3)
+- C-4: Is cross-artifact contradiction analysis (e.g. "a policy claims MFA is required but a
+  separate technical export shows accounts without MFA") a real V0.1-or-soon-after product
+  requirement, given it's a genuinely valuable compliance use case? An architectural review found
+  the Sprint 8 pipeline design (per-artifact-section evaluation, no cross-artifact prompt
+  concatenation) does not support it, and `CONFLICTS_WITH` was narrowed to a single-section
+  comparison against a control's stated requirement (`DECISIONS.md` D-014). If cross-artifact
+  contradiction is wanted, it needs its own scoped design (a second retrieval/evaluation pass
+  comparing artifacts pairwise or via a shared summary layer) — not something to retrofit silently
+  into the existing per-section pipeline. (`COMPLIANCE_MODEL.md` §3, `AI_PIPELINE.md` §12)
 
 ## UX
 
@@ -42,6 +51,12 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
 - U-6: What deletion/retention semantics are expected for assessments and evidence — hard delete,
   soft delete, or a retention window — given the audit-trail requirements elsewhere in the
   product? (`USER_FLOWS.md` §5, `SECURITY.md` T-17)
+- U-7: Should an analyst be able to explicitly override the computed "evidence sufficiency"
+  judgment for a control (e.g. mark a control as sufficiently covered despite only
+  `PARTIALLY_SUPPORTS` mappings, with a note explaining why), or is V0.1's purely computed
+  sufficiency view (`COMPLIANCE_MODEL.md` "Evidence Sufficiency") final for V0.1? An override would
+  itself need its own audit trail if added — not a small addition, so worth a deliberate decision
+  rather than adding it opportunistically later.
 
 ## Architecture
 
@@ -53,8 +68,20 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
   user-configurable? (`USER_FLOWS.md` §3, §12)
 - A-3: What is the packaging strategy for bundling the Python runtime inside the Tauri app for
   distribution (Sprint 16), and does the chosen approach affect earlier sprints' assumptions?
-  Flagged as the top technical risk in `DECISIONS.md` D-001; needs a concrete plan before Sprint
-  16, ideally validated much earlier.
+  Flagged as the top technical risk in `DECISIONS.md` D-001; a narrow validation spike is now
+  scheduled in Sprint 1 (`SPRINT_1_BACKLOG.md` S1-09) rather than waiting until Sprint 16, but the
+  final production packaging approach is still an open Sprint 16 decision.
+- A-4: Should the local frontend↔service IPC transport eventually move from TCP-over-loopback to
+  an OS-native local transport (named pipe on Windows, Unix domain socket elsewhere) for stronger
+  isolation than a shared-secret token over HTTP, or is TCP-over-loopback plus the shared-secret
+  token (`DECISIONS.md` D-009) sufficient for V0.1? The shared-secret approach was chosen as the
+  minimal fix that closes the authentication gap without a bigger transport change; revisit if a
+  future security review finds it insufficient.
+- A-5: Should the Framework → Control hierarchy be generalized beyond the current "Family is
+  optional, one level" fix (`DECISIONS.md` D-016) to support arbitrary-depth nested control
+  groupings, once a second framework's real data is available to inform the actual shape needed?
+  Deliberately not attempted in V0.1 with only one framework implemented — designing a general
+  hierarchy against a single example risks guessing wrong.
 
 ## AI
 
