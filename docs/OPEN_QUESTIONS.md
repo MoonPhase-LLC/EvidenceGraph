@@ -26,6 +26,15 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
   `SPRINTS.md` Sprint 12)
 - C-3: What is the authoritative source for NIST SP 800-53 Rev. 5 control text to be loaded in
   Sprint 3, and are there licensing/attribution requirements to satisfy? (`SPRINTS.md` Sprint 3)
+- C-4: Is cross-artifact contradiction analysis (e.g. "a policy claims MFA is required but a
+  separate technical export shows accounts without MFA") a real V0.1-or-soon-after product
+  requirement, given it's a genuinely valuable compliance use case? An architectural review found
+  the Sprint 8 pipeline design (per-artifact-section evaluation, no cross-artifact prompt
+  concatenation) does not support it, and `CONFLICTS_WITH` was narrowed to a single-section
+  comparison against a control's stated requirement (`DECISIONS.md` D-014). If cross-artifact
+  contradiction is wanted, it needs its own scoped design (a second retrieval/evaluation pass
+  comparing artifacts pairwise or via a shared summary layer) — not something to retrofit silently
+  into the existing per-section pipeline. (`COMPLIANCE_MODEL.md` §3, `AI_PIPELINE.md` §12)
 
 ## UX
 
@@ -42,19 +51,40 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
 - U-6: What deletion/retention semantics are expected for assessments and evidence — hard delete,
   soft delete, or a retention window — given the audit-trail requirements elsewhere in the
   product? (`USER_FLOWS.md` §5, `SECURITY.md` T-17)
+- U-7: V0.1 no longer computes an automatic "evidence sufficiency" verdict at all — it reports
+  independent factual Coverage Signals instead (`DECISIONS.md` D-019, `COMPLIANCE_MODEL.md`
+  "Coverage Signals"), so there is no computed field left to override. The open question is now:
+  should V0.1 (or a near-term follow-up) add an explicit, human-authored "this control is
+  adequately addressed" decision — with its own rationale and append-only history, analogous to an
+  Analyst Decision — or is showing the raw signals (support/partial/conflict/references/pending/
+  incomplete) and leaving any holistic judgment entirely outside the tool sufficient for V0.1? Such
+  a decision would need its own audit trail if added, so it's worth a deliberate product call rather
+  than adding it opportunistically.
 
 ## Architecture
 
-- A-1: Exact mechanism for Tauri↔FastAPI local port allocation (fixed default vs. dynamically
-  chosen and passed to the frontend at startup)? To be resolved concretely in Sprint 1 ticket
-  S1-04, but the general approach should have product-owner visibility given it's a security-
-  adjacent decision (`ARCHITECTURE.md` §4, §13).
+- A-1: **Resolved by D-018/D-025:** the child binds loopback port 0 and reports the bound port over
+  private inherited pipes/handles. Startup verifies the endpoint before delivering the session
+  token over that channel and releasing it to the frontend. S1-04/S1-09 validate the Windows
+  implementation; fixed-vs-dynamic allocation and environment-variable IPC are no longer open.
 - A-2: Where are models and the SQLite database stored on disk, and is either path
   user-configurable? (`USER_FLOWS.md` §3, §12)
 - A-3: What is the packaging strategy for bundling the Python runtime inside the Tauri app for
   distribution (Sprint 16), and does the chosen approach affect earlier sprints' assumptions?
-  Flagged as the top technical risk in `DECISIONS.md` D-001; needs a concrete plan before Sprint
-  16, ideally validated much earlier.
+  Flagged as the top technical risk in `DECISIONS.md` D-001; a narrow validation spike is now
+  scheduled in Sprint 1 (`SPRINT_1_BACKLOG.md` S1-09) rather than waiting until Sprint 16, but the
+  final production packaging approach is still an open Sprint 16 decision.
+- A-4: Should the local frontend↔service IPC transport eventually move from TCP-over-loopback to
+  an OS-native local transport (named pipe on Windows, Unix domain socket elsewhere) for stronger
+  isolation than a shared-secret token over HTTP, or is TCP-over-loopback plus the shared-secret
+  token (`DECISIONS.md` D-009) sufficient for V0.1? The shared-secret approach was chosen as the
+  minimal fix that closes the authentication gap without a bigger transport change; revisit if a
+  future security review finds it insufficient.
+- A-5: Should the Framework → Control hierarchy be generalized beyond the current "Family is
+  optional, one level" fix (`DECISIONS.md` D-016) to support arbitrary-depth nested control
+  groupings, once a second framework's real data is available to inform the actual shape needed?
+  Deliberately not attempted in V0.1 with only one framework implemented — designing a general
+  hierarchy against a single example risks guessing wrong.
 
 ## AI
 
@@ -68,9 +98,9 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
 
 ## Security
 
-- S-1: Should file parsing run in a sandboxed subprocess or WASM sandbox rather than in-process,
-  given the parser-exploit threat (T-01/T-02/T-03)? What's the acceptable performance/complexity
-  tradeoff?
+- S-1: Which mechanism will satisfy D-022's required parser permission and resource restrictions
+  against T-01/T-02/T-03, and what are its performance/complexity tradeoffs? The required properties
+  are fixed; only mechanism selection remains open. Decide and demonstrate it in Sprint 4 (D-010).
 - S-2: What are the concrete maximum file size and file count limits for evidence upload? (T-04)
 - S-3: Is at-rest encryption of the SQLite database required for V0.1 given the sensitivity of
   the data it may contain, or explicitly deferred with that risk accepted for V0.1? (T-12)

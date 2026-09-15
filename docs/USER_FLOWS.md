@@ -62,7 +62,10 @@ cloned/templated.
    silently re-processed.
 3. Files undergo the security handling described in `SECURITY.md` (size limits, type
    verification, sandboxed parsing) before any content is extracted.
-4. User sees per-file ingestion status: queued → parsing → parsed / failed.
+4. User sees per-file ingestion status: queued → parsing → one of `parsed` / `partial` / `empty` /
+   `unsupported_format` / `failed` (`DATABASE.md` §3) — not just a binary parsed/failed, so a
+   scanned-image PDF with no extractable text or a partially-recovered document is visible as its
+   own distinct state, not lumped in with either success or failure.
 
 Open questions: max file size and count limits for V0.1; whether folder-based bulk upload is
 required; how near-duplicate (not byte-identical) evidence is surfaced, if at all, in V0.1.
@@ -118,10 +121,23 @@ vs. thousands of nodes); whether graph state (layout, filters) persists per asse
 
 ## 11. Gap Review
 
-1. User sees a list of controls with no supporting evidence, or only low-confidence/rejected
-   evidence, within the assessment's scope.
-2. Gap severity/categorization logic (missing vs. weak vs. stale vs. conflicting) is defined in
-   `COMPLIANCE_MODEL.md`.
+1. User sees a list of controls **without** an approved `SUPPORTS` mapping ("Support present" —
+   `COMPLIANCE_MODEL.md` §2 "Finding / Gap", "Coverage Signals"). This is not a single verdict per
+   control but a set of independent, simultaneously-possible signals: Partial support present,
+   Confirmed conflict, References only, Review pending, Analysis incomplete. A control with an
+   approved `PARTIALLY_SUPPORTS` mapping and nothing else **stays in this view** as unresolved — it
+   is not treated as closed out just because some evidence exists (`DECISIONS.md` D-019 corrected an
+   earlier design that removed partial-only controls from the gap view entirely).
+2. A confirmed `CONFLICTS_WITH` mapping is surfaced as its own signal, and can coexist with
+   "Support present" on the same control (e.g. one section supports a control while another
+   conflicts with it) — the UI must show both, never collapse them into a single status.
+3. "Analysis incomplete" means relevant analysis failed, is pending, or only partially completed
+   (`DECISIONS.md` D-020) — the UI must not present this as "no evidence found," since that would be
+   an unreviewed conclusion the system isn't entitled to draw yet.
+4. A mapping contributing to a control's coverage that originated from a since-superseded analysis
+   run is visibly flagged as based on an older analysis (`DECISIONS.md` D-021), prompting the
+   analyst to re-confirm, replace, or withdraw it rather than silently trusting or silently losing
+   it.
 
 Open questions: whether gap analysis considers control baseline/applicability, or naively expects
 every control in the framework to have evidence.

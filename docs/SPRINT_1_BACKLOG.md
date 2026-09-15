@@ -73,6 +73,12 @@ independently runnable project.
   `docs/ARCHITECTURE.md` §4 open question on port allocation; for this ticket, an env-var or
   CLI-arg-configurable port with a documented default is sufficient, final allocation strategy
   can follow in S1-04/later.
+- Auth-check middleware: every request, including `GET /health`, must carry a shared-secret token
+  matching the installed session credential; mismatched/missing token → 401. The token itself is generated and propagated
+  by S1-04 over private pipes/handles in supervised mode; an env var is only the standalone test
+  setup. No authenticated endpoint is available until a credential is installed. The bounded
+  startup challenge is the sole pre-authentication protocol exception (D-025); missing
+  configuration must never disable authentication.
 - Python dependency management set up (e.g. `pyproject.toml`).
 
 **Non-goals:** No database, no real business logic endpoints yet.
@@ -80,9 +86,14 @@ independently runnable project.
 **Dependencies:** S1-01.
 
 **Acceptance criteria:** `GET http://127.0.0.1:<port>/health` returns a 200 with a status payload
-when run standalone (without Tauri).
+when run standalone (without Tauri), with the credential configured via env var and the matching
+token supplied in the request. Missing/invalid request tokens return 401, including on `/health`.
+Missing credential configuration fails closed: `/health` returns 401 even if a token is supplied.
 
-**Required tests:** A test hitting `/health` and asserting the response shape.
+**Required future implementation tests:** `/health` with the installed credential returns 200 and
+the expected response shape; missing and invalid tokens each return 401; absent credential
+configuration returns 401 both with and without a supplied token. Verify that `/health` has no
+authentication exemption and that only D-025's bounded startup challenge is available pre-authentication.
 
 ---
 
@@ -95,26 +106,55 @@ that Tauri can reliably launch, supervise, and cleanly terminate the Python serv
 process-lifecycle implications
 
 **Requirements:**
-- On app start, Tauri launches the FastAPI service as a child process.
-- Tauri determines/passes the port the service should bind to (resolving the S1-03 open
-  question — e.g. Tauri picks an available local port and passes it via env var/arg).
+- On app start, Tauri launches the exact bundled FastAPI service executable it shipped (not a
+  PATH-resolved lookup) as a child process.
+- Tauri generates a one-time **startup secret**, distinct from the D-009 session token, and
+  supplies it to the child through private inherited pipes/handles supporting communication in both
+  directions, accessible only to the parent and intended child — this is step 1 of the D-018 identity-
+  verification handshake, required *before* any port/token exchange happens.
+- The child binds a loopback port using OS-assigned allocation (bind to port 0, let the OS choose
+  and atomically reserve it) rather than a separate "find a free port, then bind" step — this
+  removes the race where an unrelated process could occupy the chosen port first.
+- The child reports the port it actually bound back to Tauri over the same private channel from
+  step 2, not by any means an unrelated process could also observe or race to claim.
+- Tauri issues a fresh challenge over the resulting HTTP endpoint and verifies the response was
+  correctly computed from the startup secret — confirming the process on that port is the one Tauri
+  spawned — without ever sending the startup secret itself over HTTP.
+- Only after that verification succeeds does Tauri generate the random per-launch **session token**
+  (`docs/DECISIONS.md` D-009), send it over the private pipe/handle channel, and wait for the child's
+  acknowledgement that authentication is ready. Only then expose the endpoint/token to the frontend
+  via Tauri IPC. Environment variables are startup snapshots, not a return channel or a way to
+  update an already-running child. Startup credential delivery uses only the private channel;
+  subsequent authenticated HTTP requests carry the session token. Never place credentials in CLI
+  arguments or logs. The token lives only in memory for the session (D-025).
+- **Fail closed**: if the child exits, fails to bind, fails to respond within a bounded timeout, or
+  fails challenge verification, no endpoint or token is ever exposed to the frontend, and Tauri does
+  not attempt to connect to whatever else may be listening on any port as a fallback.
+- Restarting the child (crash-recovery or explicit restart) generates a new startup secret and a
+  new session token; a token issued for a prior child instance must not be honored by a new one.
 - On app exit (including abnormal exit paths where feasible), the child process is terminated —
   no orphaned Python processes left running.
-- Frontend can successfully call the `/health` endpoint through this supervised process and
-  display the result on the placeholder screen from S1-02.
+- Frontend can successfully call the `/health` endpoint through this supervised, identity-verified,
+  authenticated process and display the result on the placeholder screen from S1-02.
 
 **Non-goals:** No production-grade process supervision (auto-restart on crash, etc.) — that can
 be a later hardening ticket if needed.
 
 **Dependencies:** S1-02, S1-03.
 
-**Acceptance criteria:** Launching the Tauri app starts the service; the frontend displays a
+**Acceptance criteria:** Launching the Tauri app starts the service and completes the full
+identity-verification handshake before exposing anything to the frontend; the frontend displays a
 successful health check; closing the app leaves no orphaned `python`/service process running
-(verified manually via OS process list during review).
+(verified manually via OS process list during review). Inject a fake endpoint into the test's
+startup transport to demonstrate that Tauri fails closed without sending a token or evidence to
+it. Port 0 must allocate another available port when an unrelated listener exists; do not assume
+it selects a particular occupied port. Exercise private-channel port/token exchange, replayed/wrong
+challenge, child exit and readiness timeout per D-025.
 
 **Required tests:** Manual verification steps documented in the PR description (process lifecycle
 is hard to unit test meaningfully at this stage); at minimum, an automated check that the
-frontend→service call succeeds in a dev/CI-runnable way if feasible.
+frontend→service call succeeds in a dev/CI-runnable way, and an automated or documented-manual test
+of the fail-closed fake-endpoint and port-allocation scenarios above.
 
 ---
 
@@ -213,11 +253,55 @@ whichever agent completes S1-04
   (resolved cleanly / needs a follow-up mitigation ticket) instead of leaving it as a forward-
   looking flag.
 
-**Non-goals:** No packaging/installer work (that's Sprint 16) — this is dev-mode validation only.
+**Non-goals:** No production installer polish (Sprint 16). This validation must include S1-09's
+packaged-build result, not just the development-mode loop.
 
-**Dependencies:** S1-04, S1-07.
+**Dependencies:** S1-04, S1-07, S1-09.
 
 **Acceptance criteria:** Sign-off recorded (e.g. as a comment/update on this backlog or in
-`DECISIONS.md`) that Sprint 1's exit criteria are met.
+`DECISIONS.md`) that Sprint 1's exit criteria are met, including S1-09's recorded clean-machine
+result. A failed spike cannot be marked passed: record the blocker and mitigation and obtain the
+product owner's explicit go/no-go decision before Sprint 2 proceeds.
 
 **Required tests:** N/A.
+
+---
+
+### S1-09: Packaged-build spike (clean-machine validation)
+
+**Objective:** Validate the actual top technical risk from `docs/DECISIONS.md` D-001 — bundling a
+Python runtime inside a Tauri app for distribution — as an early, narrow spike, rather than
+discovering packaging problems for the first time in Sprint 16 after fifteen sprints of feature
+work have been built on an unvalidated assumption. This is deliberately **not** full packaging/
+installer work (that stays Sprint 16); it is a minimal end-to-end proof.
+
+**Implementation owner recommendation:** Claude Code (Tauri bundler config), with Codex advising on
+Python runtime bundling options (PyInstaller/embedded interpreter/etc.)
+
+**Requirements:**
+- Run the Tauri bundler to produce an installable Windows package (e.g. an MSI/NSIS installer) that
+  embeds or bundles the Python FastAPI service in some form — the exact bundling approach
+  (PyInstaller-frozen executable, embedded Python distribution, etc.) is this ticket's own decision
+  to make and document, not assumed in advance.
+- Install and launch that package on a Windows machine **without** the development toolchain
+  installed (no system Python, no Node, no Rust toolchain present) — a real proxy for "a customer's
+  machine," not another dev environment.
+- Confirm the packaged app launches, spawns the bundled service, completes the full S1-04
+  identity-verification handshake (not just a bearer-token check) and one authenticated
+  health-check round-trip, then shuts down cleanly with no orphaned processes.
+- Record the outcome — clean pass, or specific blocking issues found — in `docs/DECISIONS.md`
+  D-001, updating it from "flagged as a risk" to either "validated early" or "needs a follow-up
+  mitigation ticket before Sprint 16," with concrete detail either way.
+
+**Non-goals:** No auto-update mechanism, no code signing, no installer UX polish, no support for
+non-Windows platforms — all Sprint 16 concerns. This ticket only needs to prove the bundling
+mechanism *can* work, not make it production-ready.
+
+**Dependencies:** S1-02, S1-03, S1-04.
+
+**Acceptance criteria:** A built installer package launches and passes the health-check round-trip
+on a clean Windows machine; `docs/DECISIONS.md` D-001 is updated with the concrete outcome.
+
+**Required tests:** Manual verification on a clean machine (VM snapshot without dev tooling is
+acceptable), documented in the PR description — this is inherently a packaging/environment
+validation, not something meaningfully unit-testable.

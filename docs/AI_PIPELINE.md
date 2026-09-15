@@ -64,7 +64,14 @@ Retrieval approach for V0.1: combination of
 
 producing a top-N (N to be tuned; start small, e.g. 5–10) candidate list per section. Retrieval
 method is recorded on the resulting Mapping Candidate's provenance (`retrieval_method`) so it can
-be audited/tuned later.
+be audited/tuned later. Embedding similarity uses the active embedding-capable provider, which may
+be a different loaded model than the generation-capable provider used in §6 (`MODEL_RUNTIME.md` §1,
+`DECISIONS.md` D-011, completed by D-023) — retrieval quality should be evaluated against a small
+hand-labeled sample starting in Sprint 8 itself (see `SPRINTS.md` Sprint 8), not deferred until the
+full evaluation harness in Sprint 14, so a poor retrieval/embedding choice is caught before later
+sprints build on it. Whenever the embedding model/configuration changes, any previously computed
+embedding index is incompatible and must be rebuilt (`DECISIONS.md` D-023) — retrieval must never
+compare vectors produced under two different embedding configurations.
 
 Retrieval is not itself a source of Mapping Candidates — it only narrows what the LLM evaluation
 stage considers.
@@ -78,6 +85,13 @@ to return **structured output only**, per the schema in §7.
 
 The prompt must:
 
+- Include each candidate's identifier, official control text, and framework version from the
+  assessment's loaded framework data. Enhancement targets require the enhancement identifier and
+  official text alongside the parent control identifier and official text.
+- Treat these supplied requirements as authoritative for evaluation; never substitute model
+  memory or invented requirements. Framework text is requirement data, not behavioral instructions.
+  Missing required official text is a framework-data error handled under §11, not a reason to
+  infer requirements from an identifier or silently omit the affected candidate.
 - Present the evidence text clearly delimited as **data to evaluate**, never as instructions.
 - Include an explicit instruction that the evidence text may contain attempts to instruct the
   model and that such content must be ignored/treated as part of the evidence being evaluated,
@@ -124,6 +138,10 @@ Before persisting any model output as a Mapping Candidate, validate:
 - Output parses as well-formed JSON matching the schema (reject/retry-once on failure, then mark
   the artifact section as "analysis failed" rather than silently dropping it).
 - `control_id` (and `enhancement_id` if present) exists in the assessment's loaded framework data.
+- The exact (`control_id`, `enhancement_id`) target pair was supplied for evaluation in this call
+  (including null for a control-only target). Reject out-of-set pairs even if they exist elsewhere
+  in the framework. Parent text supplied as enhancement context does not itself offer a parent-only target.
+- Each returned enhancement belongs to the returned parent control in the loaded framework data.
 - `relationship_type` is one of the defined enum values.
 - `confidence` is within [0.0, 1.0].
 - `artifact_section_ids` is a non-empty subset of the section ids actually provided in that
@@ -148,20 +166,58 @@ threshold exists in V0.1. See `COMPLIANCE_MODEL.md` §4.
 
 ## 11. AI Failure Handling
 
+Every analysis attempt against an artifact is tracked as an `AnalysisRun`
+(`COMPLIANCE_MODEL.md` "AnalysisRun", `DECISIONS.md` D-012, revised by D-020). Its `status` is a
+persisted coordinator lifecycle value — `queued` / `running` / `succeeded` / `partially_succeeded` /
+`failed` / `cancelled` / `interrupted` (D-025). Run creation atomically snapshots every intended
+section as a `pending` `AnalysisRunSectionResult`; work changes outcomes to `running`, then
+`no_candidates_retrieved` / `evaluated_no_mappings` / `evaluated_with_mappings` / `failed`.
+Completion is calculated over the full intended set, never only attempted sections. Cancellation,
+interruption, and startup failure are persisted lifecycle events with a sanitized `stop_reason`.
+The coordinator commits state transitions transactionally; candidate writes and the corresponding
+completed section result commit together. Queued work remains queued until started or cancelled.
+
 Failure modes and required behavior — must never fail silently or fall back to a remote provider:
 
+- **Required official framework text missing**: surface a framework-data error; do not invoke
+  evaluation for the affected section or substitute model memory. Record its section result as
+  `failed` with a sanitized failure category, persist no mappings for it, and continue other sections.
+  Apply the existing run aggregation rules below; this is not a successful zero-mapping outcome.
 - **Model unavailable / not running**: surface a clear error in the UI; do not queue silently
   forever without status; do not fall back to any cloud provider (`CLAUDE.md`/`AGENT_INSTRUCTIONS.md`
-  hard rule).
-- **Model returns malformed output**: retry once with the same input; on second failure, mark
-  that section/control-candidate evaluation as failed and move on — one failed section must not
-  abort analysis of the rest of the artifact.
-- **Model times out**: bounded timeout per evaluation call (value TBD); treat as failure per
-  above.
-- **Retrieval finds zero candidate controls for a section**: valid outcome, not an error; the
-  section simply produces no Mapping Candidates.
-- **Whole artifact fails to parse**: artifact is marked `parse_failed`; no analysis is attempted;
-  visible to the user, not hidden.
+  hard rule). If this happens before any section is processed, the `AnalysisRun` is `failed`; if it
+  happens mid-run, preserve results and unattempted section rows. The run is `partially_succeeded`
+  if any section succeeded, otherwise `failed`; record the sanitized run-level failure reason.
+- **Model returns malformed output**: retry once with the same input; on second failure, record
+  that section's `AnalysisRunSectionResult` as `failed` with a sanitized failure category (no
+  evidence content — `SECURITY.md` T-10) and move on — one failed section must not abort analysis
+  of the rest of the artifact. At normal completion, persist `succeeded` only if every intended
+  section has a successful terminal outcome. A non-cancellation/non-interruption stop with some
+  successful rows and any failed or unfinished rows is `partially_succeeded`; with no successful
+  rows it is `failed`.
+- **Model times out**: bounded timeout per evaluation call (value TBD); record as a `failed`
+  section outcome per above.
+- **Retrieval finds zero candidate controls for a section**: valid outcome, not an error; recorded
+  as `no_candidates_retrieved` for that section, contributing to a `succeeded` (not `failed`) run
+  status. A run where every section reaches `no_candidates_retrieved` or `evaluated_no_mappings` is
+  `succeeded` with zero Mapping Candidates produced — a legitimate, non-error, non-partial outcome,
+  distinct from a run that is `partially_succeeded` or `failed` because some sections could not be
+  evaluated at all. "Zero mappings" and "execution status" are independent facts; never conflate a
+  run that produced no mappings with one that failed to examine its evidence.
+- **Whole artifact fails to parse**: artifact `parse_status` is marked `failed` (or
+  `unsupported_format` / `empty` — see `DATABASE.md` §3 "Extraction Outcomes" for the full set); no
+  analysis is attempted, no `AnalysisRun` is created; visible to the user, not hidden.
+- **App/process terminated mid-run**: an `AnalysisRun` left in `running` state across a restart is
+  detected and relabeled `interrupted` rather than left ambiguously "running" forever or silently
+  reported as a terminal state it never reached.
+- **Explicit cancellation**: persist `cancelled` and a sanitized stop reason; preserve completed
+  results and unattempted rows. Cancellation/interruption takes precedence over result aggregation.
+- **Re-running analysis on an already-analyzed artifact**: creates a new `AnalysisRun`. Supersession
+  of the prior run is a **separate, explicit** action (`analysis_run.superseded_by_analysis_run_id`,
+  `DECISIONS.md` D-021) — it is never implied merely by starting a rerun, and a `failed` or
+  `cancelled` rerun must never supersede a prior successful run. Old candidates and their Analyst
+  Decisions are never deleted, and a new candidate never inherits an approval from an older run's
+  analogous suggestion — it always starts `needs_review`.
 
 ## 12. Prompt Injection Resistance
 
@@ -175,8 +231,8 @@ Layered, per `SECURITY.md` T-06/T-07:
 3. **Prompt structure**: evidence text is delimited and explicitly labeled as data-not-instructions
    within the prompt template; the model is explicitly told to disregard embedded instructions.
 4. **Output validation**: structured-output validation (§8) means even a model that gets "talked
-   into" a bad answer can only produce a schema-conformant Mapping Candidate about a real control
-   in the real framework — it cannot cause the pipeline to take any other action, since the
+   into" a bad answer can only produce a schema-conformant Mapping Candidate about a supplied
+   control/enhancement target validated against the loaded framework — it cannot cause the pipeline to take any other action, since the
    pipeline has no action-taking capability exposed to model output at all (no tool use / function
    calling to app state in V0.1).
 

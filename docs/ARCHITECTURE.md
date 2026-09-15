@@ -65,38 +65,76 @@ flowchart LR
         U3["LLM output"]
     end
     subgraph TB1["Trust boundary: file ingestion"]
-        Parser["Sandboxed parsers"]
+        Parser["Contained parsers\n(subprocess, size/time-limited)"]
     end
     subgraph TB2["Trust boundary: model output"]
         Validator["Deterministic schema validation"]
     end
+    subgraph TB3["Trust boundary: evidence rendering"]
+        Render["WebView rendering\n(escaped/inert text only)"]
+    end
     U1 --> Parser --> App["Application logic"]
     U2 -->|"checksum/signature check"| Runtime["Model runtime"]
     Runtime --> U3 --> Validator --> App
+    App --> Render --> FE["Frontend display"]
 ```
 
-Two boundaries matter most:
+Three boundaries matter most:
 
 1. **File ingestion boundary**: every uploaded file is untrusted bytes until parsed by a
-   size-limited, type-verified, sandboxed-as-practical parser. Extracted text is still treated as
-   *data*, never as instructions, downstream (see `SECURITY.md`).
+   size-limited, type-verified, contained parser. The containment mechanism is decided and
+   implemented in Sprint 4, not deferred to later hardening (`DECISIONS.md` D-010) — Sprint 13 then
+   verifies/hardens it adversarially. Process separation (a subprocess) alone is **not** the
+   requirement — the boundary must restrict the parser worker to read-only access on its own input,
+   write access to a dedicated scratch location only, no database/credential/network access, and
+   enforced memory/CPU/time/archive-size limits (`DECISIONS.md` D-022); the specific mechanism
+   providing these properties is still open (`OPEN_QUESTIONS.md` S-1). Extracted text is still
+   treated as *data*, never as instructions, downstream (see `SECURITY.md`).
 2. **Model output boundary**: LLM output is untrusted/probabilistic. It must pass deterministic
    schema validation before being persisted as a Mapping Candidate. A model that returns malformed
    JSON, an unknown control ID, or an out-of-range confidence is rejected, not "best-effort
    parsed."
+3. **Evidence rendering boundary**: evidence text, section citations, and model-generated reasoning
+   summaries are untrusted content reaching a real browser-engine rendering context (the Tauri
+   WebView). They must be rendered as inert/escaped text, never raw HTML or interpreted Markdown,
+   unless a future feature explicitly adds a sanitized rich-rendering path. See `SECURITY.md` T-21.
 
 Process boundary: the frontend (Tauri/React) never directly parses evidence, never directly talks
 to the model runtime, and never directly touches the database. Everything evidence-related goes
 through the local analysis service, which is the only component with filesystem/database/model
 access beyond what the OS file picker exposes to the frontend for selecting files to upload.
+This boundary is also where authentication applies (§4): the local service must reject any caller
+that doesn't present the current session's shared-secret token, regardless of which local process
+is calling.
 
 ## 4. Desktop / Frontend / Backend Interaction
 
 - Tauri launches the FastAPI service as a local child process on app start and terminates it on
   app exit.
 - Frontend communicates with the service over HTTP restricted to `127.0.0.1` on a locally
-  allocated port (not a fixed well-known port, to reduce collision/hijack risk — open question,
-  see `DECISIONS.md`).
+  allocated port, bound atomically by the child using port 0 (D-018/D-025).
+- Localhost binding restricts *network* reachability but is not authentication (`SECURITY.md`
+  T-09): the Tauri host generates a random shared-secret token at each app launch, passes it to the
+  verified FastAPI child through private inherited pipes/handles and to the frontend via Tauri IPC,
+  and every local-service request must carry that token (`DECISIONS.md` D-009). This is a
+  lightweight, session-scoped mechanism — not a user login/credential system.
+- A token alone doesn't prove the *service* is legitimate, so startup additionally runs a
+  fail-closed identity-verification handshake before any token or evidence is exposed to the
+  frontend (`DECISIONS.md` D-018): Tauri launches its own bundled service executable and passes a
+  one-time startup secret via private inherited pipes/handles supporting both directions; the child
+  binds an OS-assigned loopback
+  port (port 0) and reports it back over that same private channel; Tauri then issues a challenge
+  over the resulting HTTP endpoint and verifies the response against the startup secret, without
+  ever sending that secret over HTTP. After verification, Tauri sends the session token through
+  the private channel and waits for the child's authentication-ready acknowledgement before
+  exposing the endpoint/token to the frontend (D-025). Environment variables cannot provide this
+  bidirectional exchange. Any failure (child exit, bind failure, timeout, bad challenge
+  response) fails closed — no fallback to whatever else may be listening on a port.
+- The model runtime (llama.cpp) has its **own** independent credential, separate from the D-009
+  token, held only within the FastAPI process boundary and never exposed to the frontend
+  (`DECISIONS.md` D-017, `MODEL_RUNTIME.md` §10) — the FastAPI↔frontend boundary and the
+  FastAPI↔model-runtime boundary are each authenticated on their own terms, not one inheriting
+  security from the other.
 - No remote network calls originate from the local analysis service in V0.1 except: (a) model
   catalog fetch/download, which is an explicit, visible, user-initiated network action, never
   silent.
@@ -110,10 +148,15 @@ implementation detail the frontend never depends on directly.
 
 ## 6. Model Runtime
 
-See `MODEL_RUNTIME.md` for detail. Architecturally: the AI pipeline depends only on a
-`ModelProvider` interface (roughly: `generate(prompt, schema) -> structured_output`,
-`health_check()`, `list_available()`), not on llama.cpp specifics. V0.1 ships exactly one
-implementation, `LlamaCppProvider`, run as a local subprocess/server bound to localhost.
+See `MODEL_RUNTIME.md` for detail. Architecturally: the AI pipeline depends only on capability
+interfaces — `GenerationCapable` (`generate(prompt, schema) -> structured_output`) and
+`EmbeddingCapable` (`embed(text) -> vector`) — not on llama.cpp specifics, and not on the
+assumption that one model must serve both roles (`DECISIONS.md` D-011, completed by D-023: each
+capability gets its own health check, hardware feasibility accounts for both models' combined
+footprint if run simultaneously, and provenance records both models' identities separately). V0.1
+ships exactly one provider implementation, `LlamaCppProvider`, which may back either or both
+capabilities, run as a local subprocess/server bound to localhost and gated by its own
+authentication credential independent of the FastAPI↔frontend token (`DECISIONS.md` D-017).
 
 ## 7. Document Pipeline
 
@@ -130,6 +173,13 @@ walks Framework → Family → Control → Enhancement, resolves candidate contr
 control detail must work for any framework conforming to the (yet-to-be-finalized-in-detail)
 framework data format — it must not special-case NIST identifiers (e.g. must not assume all
 control IDs match `^[A-Z]{2}-\d+$`, since future frameworks will not share that shape).
+
+Family is **optional**, not required: a Control may belong to a Control Family or attach directly
+to its Framework (`DECISIONS.md` D-016). Requiring every framework to have a family-level grouping
+would itself be a NIST-shaped assumption baked into the schema, even though NIST 800-53 Rev. 5 does
+use families. Full arbitrary-depth nested grouping is explicitly not attempted in V0.1 — see
+`OPEN_QUESTIONS.md` A-5 — this is a proportional fix (optional single grouping level), not a
+generalized hierarchy engine.
 
 ## 9. AI Pipeline (Summary)
 
@@ -172,8 +222,9 @@ SQLite/SQLAlchemy, llama.cpp/GGUF) is accepted for V0.1 with the following notes
   process. Reasonable fit for a security-focused desktop tool.
 - **Python/FastAPI local service over doing everything in the Rust/Tauri host**: accepted because
   the document parsing, embeddings, and llama.cpp ecosystem tooling is materially more mature in
-  Python. Tradeoff: introduces an IPC/process boundary (mitigated by binding strictly to
-  localhost) and a second runtime to package/ship. This is the single biggest packaging risk for
+  Python. Tradeoff: introduces an IPC/process boundary requiring loopback binding, authentication,
+  and verified startup (D-017/D-018/D-025), and a second runtime to package/ship. This is the single
+  biggest packaging risk for
   V0.1 (bundling a Python runtime inside a Tauri app) and should be validated early in Sprint 1
   rather than assumed to be smooth.
 - **SQLite/SQLAlchemy**: appropriate for a local-first, single-writer desktop app. No objection.
@@ -183,5 +234,5 @@ SQLite/SQLAlchemy, llama.cpp/GGUF) is accepted for V0.1 with the following notes
 - **No graph database, no message queue, no Kubernetes, no microservices**: correct call for this
   scope; see `DECISIONS.md` D-002.
 
-Open architectural question flagged, not resolved here: exact mechanism for Tauri↔FastAPI process
-supervision and port allocation. See `docs/OPEN_QUESTIONS.md`.
+Port allocation and the startup exchange are defined by D-018/D-025. The concrete Windows
+pipe/handle and process-supervision implementation is validated in S1-04/S1-09.
