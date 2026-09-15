@@ -321,7 +321,9 @@ when no approved `SUPPORTS` mapping exists. Approved `CONFLICTS_WITH` and `REFER
 never establish support. A confirmed conflict remains visible alongside support when both exist;
 none of these signals is an automatic sufficiency judgment. (b) `CONFLICTS_WITH` in V0.1
 is scoped to **a single artifact section's content appearing to contradict a single candidate
-control's requirement**, evaluated using the model's own knowledge of what the control requires
+control's requirement**, evaluated using the official requirements supplied from the assessment's
+loaded framework data, including framework version and enhancement/parent text where applicable
+(`AI_PIPELINE.md` §6–§8), never model memory or invented requirements
 (e.g. a section describing "MFA is optional" against a control requiring MFA) — not a comparison
 between two separate artifacts. True cross-artifact contradiction detection (e.g. policy vs.
 technical export) is **not supported in V0.1** and is explicitly deferred; the misleading example
@@ -411,7 +413,10 @@ Startup credential delivery never uses CLI arguments or HTTP. Subsequent request
 frontend to the local service must
 include this secret as a bearer token / custom header. The service rejects any request missing or
 mismatching the token before doing any other work; the bounded startup challenge defined in D-025
-is the explicit pre-authentication protocol exception. The secret is held only in memory for the
+is the sole pre-authentication protocol exception for FastAPI. `GET /health` requires the installed
+session credential: missing or invalid tokens return 401. Missing credential configuration must
+never disable authentication; `/health` returns 401 even if a token is supplied in that state.
+The secret is held only in memory for the
 lifetime of the app session; it is never persisted to disk or logged. Localhost-only binding
 (`SECURITY.md` T-09) remains a defense-in-depth measure but is no longer the sole justification for
 skipping auth.

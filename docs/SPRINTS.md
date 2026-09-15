@@ -281,6 +281,18 @@ pipeline. D-025's run lifecycle and integrity acceptance cases are required: una
 cannot yield success; cancellation/interruption remain distinguishable; duplicate/cross-artifact
 section results, self-replacement and replacement cycles are rejected transactionally.
 
+**Required future Sprint 8 acceptance cases (official requirement grounding):**
+
+- Inspect evaluation prompts: every supplied candidate includes its identifier, official control
+  text, and assessment-loaded framework version; enhancements include their identifier and official
+  text plus the parent control text. Supplied requirements govern evaluation, never model memory.
+- Missing required control or enhancement text surfaces a framework-data error and fails the
+  affected section without inference or persisted mappings; run status follows `AI_PIPELINE.md` §11.
+- Reject returned target pairs not supplied in that call, even when present elsewhere in the framework.
+- Reject an enhancement paired with a control that is not its parent.
+- Accept an otherwise valid supplied target with correct enhancement ownership (or a supplied
+  control-only target), preserving provenance and mandatory human review.
+
 ---
 
 ## Sprint 9 — Policy-to-Control Mapping

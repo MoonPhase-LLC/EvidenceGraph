@@ -73,12 +73,11 @@ independently runnable project.
   `docs/ARCHITECTURE.md` §4 open question on port allocation; for this ticket, an env-var or
   CLI-arg-configurable port with a documented default is sufficient, final allocation strategy
   can follow in S1-04/later.
-- Auth-check middleware: every request (except perhaps `/health` itself, for simple liveness
-  probing — product owner's call) must carry a shared-secret token matching the installed session
-  credential; mismatched/missing token → 401. The token itself is generated and propagated
+- Auth-check middleware: every request, including `GET /health`, must carry a shared-secret token
+  matching the installed session credential; mismatched/missing token → 401. The token itself is generated and propagated
   by S1-04 over private pipes/handles in supervised mode; an env var is only the standalone test
-  setup. No evidence/business endpoint is available until a credential is installed. The bounded
-  startup challenge is the explicit pre-authentication protocol exception (D-025); missing
+  setup. No authenticated endpoint is available until a credential is installed. The bounded
+  startup challenge is the sole pre-authentication protocol exception (D-025); missing
   configuration must never disable authentication.
 - Python dependency management set up (e.g. `pyproject.toml`).
 
@@ -87,11 +86,14 @@ independently runnable project.
 **Dependencies:** S1-01.
 
 **Acceptance criteria:** `GET http://127.0.0.1:<port>/health` returns a 200 with a status payload
-when run standalone (without Tauri) and a valid token env var set; a request with a missing/wrong
-token to an auth-required endpoint returns 401.
+when run standalone (without Tauri), with the credential configured via env var and the matching
+token supplied in the request. Missing/invalid request tokens return 401, including on `/health`.
+Missing credential configuration fails closed: `/health` returns 401 even if a token is supplied.
 
-**Required tests:** A test hitting `/health` and asserting the response shape; a test asserting the
-401 behavior on a missing/invalid token.
+**Required future implementation tests:** `/health` with the installed credential returns 200 and
+the expected response shape; missing and invalid tokens each return 401; absent credential
+configuration returns 401 both with and without a supplied token. Verify that `/health` has no
+authentication exemption and that only D-025's bounded startup challenge is available pre-authentication.
 
 ---
 

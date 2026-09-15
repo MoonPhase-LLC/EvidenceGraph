@@ -239,7 +239,8 @@ schema.
   (useful as a low-confidence catch-all rather than forcing SUPPORTS on weak matches).
 - `CONFLICTS_WITH` — the evidence in **a single artifact section** appears to contradict what the
   candidate control requires (e.g. a section stating "MFA is optional" evaluated against a control
-  requiring MFA, using the model's own understanding of the control's requirement). Kept in V0.1
+  requiring MFA, using the supplied official framework requirements per `AI_PIPELINE.md` §6,
+  never model memory or invented requirements). Kept in V0.1
   because it is a distinct and valuable signal, not just low confidence. **Not** a comparison
   between two different artifacts (e.g. a policy document vs. a separate technical export) — that
   is cross-artifact contradiction analysis, which V0.1's per-artifact-section pipeline design does

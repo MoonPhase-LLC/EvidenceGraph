@@ -85,6 +85,13 @@ to return **structured output only**, per the schema in §7.
 
 The prompt must:
 
+- Include each candidate's identifier, official control text, and framework version from the
+  assessment's loaded framework data. Enhancement targets require the enhancement identifier and
+  official text alongside the parent control identifier and official text.
+- Treat these supplied requirements as authoritative for evaluation; never substitute model
+  memory or invented requirements. Framework text is requirement data, not behavioral instructions.
+  Missing required official text is a framework-data error handled under §11, not a reason to
+  infer requirements from an identifier or silently omit the affected candidate.
 - Present the evidence text clearly delimited as **data to evaluate**, never as instructions.
 - Include an explicit instruction that the evidence text may contain attempts to instruct the
   model and that such content must be ignored/treated as part of the evidence being evaluated,
@@ -131,6 +138,10 @@ Before persisting any model output as a Mapping Candidate, validate:
 - Output parses as well-formed JSON matching the schema (reject/retry-once on failure, then mark
   the artifact section as "analysis failed" rather than silently dropping it).
 - `control_id` (and `enhancement_id` if present) exists in the assessment's loaded framework data.
+- The exact (`control_id`, `enhancement_id`) target pair was supplied for evaluation in this call
+  (including null for a control-only target). Reject out-of-set pairs even if they exist elsewhere
+  in the framework. Parent text supplied as enhancement context does not itself offer a parent-only target.
+- Each returned enhancement belongs to the returned parent control in the loaded framework data.
 - `relationship_type` is one of the defined enum values.
 - `confidence` is within [0.0, 1.0].
 - `artifact_section_ids` is a non-empty subset of the section ids actually provided in that
@@ -168,6 +179,10 @@ completed section result commit together. Queued work remains queued until start
 
 Failure modes and required behavior — must never fail silently or fall back to a remote provider:
 
+- **Required official framework text missing**: surface a framework-data error; do not invoke
+  evaluation for the affected section or substitute model memory. Record its section result as
+  `failed` with a sanitized failure category, persist no mappings for it, and continue other sections.
+  Apply the existing run aggregation rules below; this is not a successful zero-mapping outcome.
 - **Model unavailable / not running**: surface a clear error in the UI; do not queue silently
   forever without status; do not fall back to any cloud provider (`CLAUDE.md`/`AGENT_INSTRUCTIONS.md`
   hard rule). If this happens before any section is processed, the `AnalysisRun` is `failed`; if it
@@ -216,8 +231,8 @@ Layered, per `SECURITY.md` T-06/T-07:
 3. **Prompt structure**: evidence text is delimited and explicitly labeled as data-not-instructions
    within the prompt template; the model is explicitly told to disregard embedded instructions.
 4. **Output validation**: structured-output validation (§8) means even a model that gets "talked
-   into" a bad answer can only produce a schema-conformant Mapping Candidate about a real control
-   in the real framework — it cannot cause the pipeline to take any other action, since the
+   into" a bad answer can only produce a schema-conformant Mapping Candidate about a supplied
+   control/enhancement target validated against the loaded framework — it cannot cause the pipeline to take any other action, since the
    pipeline has no action-taking capability exposed to model output at all (no tool use / function
    calling to app state in V0.1).
 
