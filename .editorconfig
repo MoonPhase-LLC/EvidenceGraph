@@ -1,0 +1,38 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Rust: rustfmt's default is 4-space indentation
+[*.rs]
+indent_size = 4
+
+# Python: PEP 8 default is 4-space indentation
+[*.{py,pyi}]
+indent_size = 4
+
+# TypeScript / JavaScript / JSON / frontend config
+[*.{ts,tsx,js,jsx,json,jsonc}]
+indent_size = 2
+
+# Tauri / Cargo config
+[*.toml]
+indent_size = 4
+
+# Markdown: preserve trailing double-space hard line breaks
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows batch files require CRLF
+[*.{bat,cmd}]
+end_of_line = crlf
+
+# Lockfiles are machine-generated; do not reformat
+[{package-lock.json,pnpm-lock.yaml,yarn.lock,Cargo.lock,uv.lock,poetry.lock}]
+insert_final_newline = unset
+trim_trailing_whitespace = unset

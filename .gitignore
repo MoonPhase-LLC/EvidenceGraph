@@ -216,3 +216,72 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Node.js / frontend (React + TypeScript, Tauri frontend build)
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnp.*
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.vite/
+
+# ---------------------------------------------------------------------------
+# Rust / Tauri
+# ---------------------------------------------------------------------------
+# `target/` above already covers Cargo's build output wherever it appears
+# (including src-tauri/target/). Cargo.lock is intentionally NOT ignored for
+# the application crate(s) — application binaries should commit their lockfile.
+**/*.rs.bk
+*.pdb
+
+# Tauri bundler output/artifacts (installers, updater bundles, WiX cache)
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/schemas/
+
+# ---------------------------------------------------------------------------
+# Local credentials / secrets (defense in depth; never commit real secrets)
+# ---------------------------------------------------------------------------
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Editor / OS clutter
+# ---------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# JetBrains IDEs
+.idea/
+
+# VS Code (keep shared workspace recommendations, ignore personal settings)
+.vscode/*
+!.vscode/extensions.json
+
+# Generic editor swap/backup files
+*~
+*.swp
+*.swo

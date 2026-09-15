@@ -61,6 +61,12 @@ Any coding agent (human or AI) should read `docs/AGENT_INSTRUCTIONS.md` and the 
 subsystem doc before making changes. See also the root [`CLAUDE.md`](CLAUDE.md) for the git
 workflow and forbidden actions.
 
+## Contributing / Environment Setup
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository tooling conventions, minimum/recommended
+Node.js/Rust/Python versions, and Windows development prerequisites for the planned Tauri
+stack.
+
 ## Technology (proposed, evaluated in `docs/ARCHITECTURE.md`)
 
 Tauri (desktop shell) · React + TypeScript + Tailwind/shadcn-ui (frontend) · Python + FastAPI
