@@ -111,9 +111,9 @@ See `ARCHITECTURE.md` §3 for the diagram. Restated as boundaries for threat ana
 
 Tracked in full in `docs/OPEN_QUESTIONS.md` (Security category); summarized here for visibility:
 
-- Should file parsing run in a sandboxed subprocess (or WASM sandbox) rather than in-process? The
-  *timing* of this decision is no longer open — it must be made in Sprint 4 (`DECISIONS.md` D-010)
-  — only the specific mechanism remains open.
+- Which parser-containment mechanism will satisfy D-022's required permission and resource
+  restrictions? Only the mechanism remains open; the properties are fixed, and it must be selected
+  and demonstrated in Sprint 4 (`DECISIONS.md` D-010).
 - What are the concrete max file size / count limits?
 - Is at-rest encryption of the SQLite database required for V0.1, given how sensitive the data
   is, or deferred?

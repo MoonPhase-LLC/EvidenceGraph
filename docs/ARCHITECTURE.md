@@ -222,8 +222,9 @@ SQLite/SQLAlchemy, llama.cpp/GGUF) is accepted for V0.1 with the following notes
   process. Reasonable fit for a security-focused desktop tool.
 - **Python/FastAPI local service over doing everything in the Rust/Tauri host**: accepted because
   the document parsing, embeddings, and llama.cpp ecosystem tooling is materially more mature in
-  Python. Tradeoff: introduces an IPC/process boundary (mitigated by binding strictly to
-  localhost) and a second runtime to package/ship. This is the single biggest packaging risk for
+  Python. Tradeoff: introduces an IPC/process boundary requiring loopback binding, authentication,
+  and verified startup (D-017/D-018/D-025), and a second runtime to package/ship. This is the single
+  biggest packaging risk for
   V0.1 (bundling a Python runtime inside a Tauri app) and should be validated early in Sprint 1
   rather than assumed to be smooth.
 - **SQLite/SQLAlchemy**: appropriate for a local-first, single-writer desktop app. No objection.

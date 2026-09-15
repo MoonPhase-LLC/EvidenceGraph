@@ -98,9 +98,9 @@ resolution inline and mark Resolved) or as new ones surface during implementatio
 
 ## Security
 
-- S-1: Should file parsing run in a sandboxed subprocess or WASM sandbox rather than in-process,
-  given the parser-exploit threat (T-01/T-02/T-03)? What's the acceptable performance/complexity
-  tradeoff?
+- S-1: Which mechanism will satisfy D-022's required parser permission and resource restrictions
+  against T-01/T-02/T-03, and what are its performance/complexity tradeoffs? The required properties
+  are fixed; only mechanism selection remains open. Decide and demonstrate it in Sprint 4 (D-010).
 - S-2: What are the concrete maximum file size and file count limits for evidence upload? (T-04)
 - S-3: Is at-rest encryption of the SQLite database required for V0.1 given the sensitivity of
   the data it may contain, or explicitly deferred with that risk accepted for V0.1? (T-12)

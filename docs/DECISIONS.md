@@ -179,9 +179,9 @@ review correctly flagged that this sequencing means the app runs untrusted-file 
 sprints before its containment boundary is even decided, and Sprint 13 would then have to retrofit
 a security boundary around code that already exists and already has callers — which is backwards.
 
-**Decision:** The parser containment/security boundary (subprocess isolation vs. in-process with
-hard resource limits vs. WASM sandbox — the actual mechanism is still the product owner's call, see
-`OPEN_QUESTIONS.md` S-1) must be **decided and implemented as part of Sprint 4**, before parsers are
+**Decision:** The parser containment/security boundary must satisfy D-022's required permission
+and resource restrictions. The actual mechanism remains the product owner's call (see
+`OPEN_QUESTIONS.md` S-1) and must be **decided and implemented as part of Sprint 4**, before parsers are
 wired into the rest of the pipeline. Sprint 13 shifts to *hardening and adversarial verification* of
 that existing boundary (fuzzing, malicious-file test corpus, resource-limit tuning under load) —
 not introducing the boundary itself.
@@ -189,9 +189,9 @@ not introducing the boundary itself.
 **Consequences:** Sprint 4 gets slightly larger (must include a containment decision + baseline
 implementation, not just parsing logic). `SPRINTS.md` Sprint 4 and Sprint 13 are updated accordingly.
 This does not mandate a specific mechanism (no new sandboxing infrastructure like a container
-runtime is implied) — a size/time-limited subprocess-per-parse using standard library process
-isolation is sufficient for V0.1 and keeps within the "avoid unnecessary infrastructure" engineering
-rule.
+runtime is implied). Any chosen mechanism must satisfy and demonstrate D-022's required permission
+and resource restrictions; ordinary subprocess isolation with size/time limits alone is not
+sufficient containment for V0.1.
 
 ---
 
@@ -223,13 +223,13 @@ time," not "one model process total."
 requirement (still local-only, still no concurrent multi-model *serving fleet*) — this only removes
 an incorrect architectural assumption that generation and embedding must share one model/process.
 Whether V0.1 ships one process or two is an implementation decision for Sprint 5/6, informed by
-retrieval quality testing (see D-012 note on evaluation timing).
+retrieval quality testing (see `AI_PIPELINE.md` §5 and `SPRINTS.md` Sprint 8).
 
 ---
 
 ## D-012: AnalysisRun entity added to track analysis attempts and bundle analysis configuration
 
-**Status:** Accepted, amended by D-020 and D-021
+**Status:** Accepted, amended by D-015, D-020, D-021 and D-025
 
 **Note (added by D-020/D-021):** The original `status` enum (`succeeded` / `succeeded_no_mappings`
 / `failed` / `superseded`) conflated three different axes: execution progress (did the run finish,
@@ -249,16 +249,17 @@ produced (model version, framework version, parser/chunker version, prompt versi
 for provenance and reproducibility.
 
 **Decision:** Add an `AnalysisRun` entity: one row per analysis attempt against one artifact
-(batch operations create independent runs, clarified by D-025), with an original status of `succeeded` / `succeeded_no_mappings` /
-`failed` / `superseded`, and immutable configuration-identity fields (see D-013). Every
-`Mapping Candidate` gets a required `analysis_run_id` FK instead of loosely-typed
-`model_provider`/`model_identifier`/`model_version` columns duplicated per row.
+(batch operations create independent runs, clarified by D-025), with persisted lifecycle state
+defined by D-020/D-025, a separate supersession relationship (D-021), and immutable configuration
+identity (D-013/D-023). `Mapping Candidate.analysis_run_id` is required for AI-sourced mappings and
+null for `analyst_manual` mappings (D-015). AI provenance lives on the referenced run rather than
+duplicating `model_provider`/`model_identifier`/`model_version` on each mapping.
 
 **Consequences:** One additional table and migration (Sprint 8, alongside `mapping_candidate`
 itself — no schema churn since `mapping_candidate` doesn't exist yet in any shipped migration).
-Enables an "artifact analysis status" view (not analyzed / succeeded / no mappings found / failed /
-stale-superseded) that the current model could not represent. See `COMPLIANCE_MODEL.md` §2 and
-`DATABASE.md`.
+Enables an artifact analysis view that distinguishes lifecycle state, output count, and
+supersession instead of combining them into one status. See `COMPLIANCE_MODEL.md` §2 and
+`DATABASE.md` for the current D-020/D-021/D-025 contract.
 
 ---
 
@@ -313,11 +314,12 @@ different artifacts**, but `AI_PIPELINE.md` §12 point 2 states evaluation is sc
 section and prompts are never concatenated across artifacts — meaning V0.1's pipeline, as designed,
 cannot actually detect that kind of cross-artifact contradiction.
 
-**Decision:** (a) "Coverage" for gap computation counts only mapping candidates whose latest
-Analyst Decision is `approved` **and** whose `relationship_type` is `SUPPORTS` or
-`PARTIALLY_SUPPORTS`. An approved `CONFLICTS_WITH` or `REFERENCES` mapping never counts toward
-coverage, regardless of approval status. An approved `CONFLICTS_WITH` instead surfaces as its own
-signal (a confirmed conflict) alongside, not instead of, the gap view. (b) `CONFLICTS_WITH` in V0.1
+**Decision (coverage amended by D-019):** (a) Only an approved `SUPPORTS` mapping establishes the
+"Support present" signal and removes a control from the coverage-gap view. Approved
+`PARTIALLY_SUPPORTS` mappings establish a separate partial-support signal and remain in that view
+when no approved `SUPPORTS` mapping exists. Approved `CONFLICTS_WITH` and `REFERENCES` mappings
+never establish support. A confirmed conflict remains visible alongside support when both exist;
+none of these signals is an automatic sufficiency judgment. (b) `CONFLICTS_WITH` in V0.1
 is scoped to **a single artifact section's content appearing to contradict a single candidate
 control's requirement**, evaluated using the model's own knowledge of what the control requires
 (e.g. a section describing "MFA is optional" against a control requiring MFA) — not a comparison

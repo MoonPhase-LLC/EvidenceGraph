@@ -50,8 +50,10 @@ root `CLAUDE.md`, which these rules are consistent with and expand on.
     does, that's an architecture-level decision requiring product-owner approval first, not a
     routine implementation choice. Localhost binding is a network-reachability control, not
     authentication (`docs/SECURITY.md` T-09) — the FastAPI service must also enforce the per-launch
-    shared-secret token from `docs/DECISIONS.md` D-009 on every request; do not remove or bypass
-    that check under the assumption that localhost binding alone is sufficient.
+    shared-secret token from `docs/DECISIONS.md` D-009, with D-025's bounded startup challenge as
+    the explicit pre-authentication protocol exception. Follow D-018/D-025's verified startup
+    exchange and D-017's independent model-server authentication; localhost binding never replaces
+    these checks.
 14. Never place evidence content, extracted text, or prompts containing evidence into logs. Logs
     may contain structural metadata (file hash, size, status, error class) only. See
     `docs/SECURITY.md` T-10.
