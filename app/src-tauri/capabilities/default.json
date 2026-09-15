@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window. Intentionally minimal: no filesystem, shell, process, or opener permissions are granted. S1-02 renders a static placeholder only. A file-open-dialog permission and the ability to spawn exactly one child process (the local analysis service) are anticipated by docs/SPRINT_1_BACKLOG.md S1-02/S1-04/T-14, but are not implemented here — add them only in the ticket that implements that behavior, scoped to that behavior alone.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
