@@ -9,9 +9,12 @@ workflow.
 ## Repository conventions
 
 - **`.editorconfig`** defines whitespace, indentation, encoding, and line-ending rules per
-  language. Most editors pick this up automatically (no plugin needed in VS Code, JetBrains
-  IDEs support it natively). It does not reformat existing files by itself — it only guides
-  new edits.
+  language. JetBrains IDEs support EditorConfig natively; VS Code requires installing the
+  [EditorConfig for VS Code](https://marketplace.visualstudio.com/items?itemName=EditorConfig.EditorConfig)
+  extension — it is not built in. See the official
+  [list of editors/plugins with EditorConfig support](https://editorconfig.org/#pre-installed)
+  for your own editor. It does not reformat existing files by itself — it only guides new
+  edits.
 - **`.gitignore`** covers Node/frontend, Rust/Tauri, and Python build artifacts, plus common
   editor/OS clutter and local-secret filename patterns. Lockfiles (`Cargo.lock`,
   `package-lock.json`, etc.) are intentionally **not** ignored — see "Dependency lockfiles"
@@ -39,25 +42,34 @@ baseline instead of each picking its own.
 
 | Tool | Minimum supported | Recommended for development |
 |---|---|---|
-| Node.js | 22.x (Maintenance LTS) | 24.x (Active LTS) |
-| Rust | 1.78 (stable) | Latest stable via `rustup update` |
+| Node.js | 22.12.0+ | 24.x (Active LTS) |
+| Rust | latest stable (see note) | latest stable via `rustup update` |
 | Python | 3.11 | 3.12 |
 
 Rationale, checked against official sources as of 2026-09-15:
 
-- **Node.js**: Node 22.x entered Maintenance LTS and remains supported (security fixes) until
-  2027-04-30; Node 24.x is the current Active LTS line (supported until 2028-04-30), which is
-  what the Tauri CLI and Vite tooling will be developed and tested against. Earlier lines
-  (Node 20 and below) are already end-of-life. Source: the
-  [Node.js Release schedule](https://github.com/nodejs/Release#readme).
-- **Rust**: Tauri v2 was released with a minimum supported Rust version (MSRV) of 1.78; that is
-  the floor for anything built against the Tauri v2 crates. In practice, contributors should
-  install the latest stable Rust via `rustup` — Tauri's own Windows tooling has occasionally
-  needed a newer toolchain than its published MSRV for specific build scenarios (see
-  [tauri-apps/tauri#14433](https://github.com/tauri-apps/tauri/issues/14433)), and keeping
-  `rustup` current avoids chasing that gap manually. Sources:
-  [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/) and
-  [tauri-apps/tauri#11205](https://github.com/tauri-apps/tauri/pull/11205) (MSRV history).
+- **Node.js**: Vite (which the React/TypeScript frontend will use) currently requires
+  Node.js `20.19+` or `22.12+` — the `22.x` line only satisfies that from `22.12.0` onward, not
+  from `22.0.0`. Since Node 20.x is already at or past end-of-life while `22.x` remains under
+  Maintenance LTS (supported until 2027-04-30), the floor here is `22.12.0`, not a generic
+  `22.x`. Node 24.x is the current Active LTS line (supported until 2028-04-30) and is
+  recommended for development. Source: [Vite — Getting Started](https://vite.dev/guide/) and
+  the [Node.js Release schedule](https://github.com/nodejs/Release#readme). **This floor is not
+  final**: S1-02 selects the actual Tauri CLI/frontend dependencies and may require a higher
+  Node minimum than `22.12.0` — S1-02 must record and validate whatever floor its concrete
+  dependencies actually need.
+- **Rust**: no verified minimum is set here, because no Tauri project exists yet to test
+  against. Historically, Tauri v2 launched with a published upstream MSRV of 1.78
+  ([tauri-apps/tauri#11205](https://github.com/tauri-apps/tauri/pull/11205)), but that is an
+  upstream Tauri crate MSRV at a point in time, not a validated minimum for *this* project's
+  eventual dependency set, and Tauri's own Windows tooling has since needed a newer toolchain
+  than its published MSRV for specific build scenarios
+  ([tauri-apps/tauri#14433](https://github.com/tauri-apps/tauri/issues/14433)). Until S1-02
+  initializes the Tauri project and pins a toolchain, contributors should simply install the
+  latest stable Rust via [rustup](https://rustup.rs/). **S1-02 must record the Rust toolchain
+  version it builds/tests against and validate it against the dependencies it actually
+  selects** (e.g. via `rust-toolchain.toml` or CI), rather than this document asserting an
+  untested floor. See [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/).
 - **Python**: Python 3.10 is within a few weeks of losing even security support (its
   end-of-life is 2026-10-31 per the [Python developer's guide release
   cycle](https://devguide.python.org/versions/)), so it is not a safe floor for a project

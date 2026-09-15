@@ -32,7 +32,13 @@ trim_trailing_whitespace = false
 [*.{bat,cmd}]
 end_of_line = crlf
 
-# Lockfiles are machine-generated; do not reformat
+# Lockfiles are machine-generated; exempt them from every inherited formatting
+# rule above (charset, line ending, final newline, trailing whitespace, indent
+# style/size) so their own tool's output is never altered by this config.
 [{package-lock.json,pnpm-lock.yaml,yarn.lock,Cargo.lock,uv.lock,poetry.lock}]
+charset = unset
+end_of_line = unset
 insert_final_newline = unset
 trim_trailing_whitespace = unset
+indent_style = unset
+indent_size = unset
