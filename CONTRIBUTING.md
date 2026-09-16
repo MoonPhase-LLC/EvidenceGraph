@@ -1,7 +1,8 @@
 # Contributing to EvidenceGraph
 
-This document covers repository conventions and the toolchain versions the upcoming
-Tauri/Rust, React/TypeScript, and Python projects will target. See
+This document covers repository conventions and the toolchain versions the Tauri/Rust +
+React/TypeScript desktop shell (`app/`, since S1-02) and the upcoming Python/FastAPI service
+target. See
 [`docs/AGENT_INSTRUCTIONS.md`](docs/AGENT_INSTRUCTIONS.md) for the rules that govern any
 coding agent working in this repository, and the root [`CLAUDE.md`](CLAUDE.md) for the git
 workflow.
@@ -25,82 +26,86 @@ workflow.
 
 ### Dependency lockfiles
 
-When each project is initialized, commit its lockfile so builds are reproducible:
+Commit each project's lockfile so builds are reproducible:
 
-- `src-tauri/Cargo.lock` (Rust/Tauri — this is an application, not a library, so the lockfile
-  should be committed per Cargo's own guidance).
-- `package-lock.json` (or the lockfile for whichever Node package manager is chosen).
+- `app/src-tauri/Cargo.lock` (Rust/Tauri — this is an application, not a library, so the
+  lockfile is committed per Cargo's own guidance). Committed as of S1-02.
+- `app/package-lock.json` (npm was used as the package manager — already available with the
+  Node.js install, no extra tooling required). Committed as of S1-02.
 - A Python lockfile appropriate to whatever dependency manager is chosen for the FastAPI
-  service (e.g. `uv.lock` or `poetry.lock`).
+  service (e.g. `uv.lock` or `poetry.lock`) — not yet applicable, pending S1-03.
 
 ## Minimum and recommended tool versions
 
 "Minimum supported" is the oldest version the project is expected to work with. "Recommended"
-is what contributors should actually install for day-to-day development. These are documented
-now, before the Tauri/React/FastAPI projects exist, so every later ticket starts from the same
-baseline instead of each picking its own.
+is what contributors should actually install for day-to-day development. These were first
+documented in S1-01 before any project existed, and are now validated against the actual
+Tauri/React dependency set initialized in S1-02, so later tickets (starting with the Python/
+FastAPI service in S1-03) have a consistent baseline instead of each picking its own.
 
-| Tool | Minimum supported | Recommended for development |
-|---|---|---|
-| Node.js | 22.12.0+ | 24.x (Active LTS) |
-| Rust | latest stable (see note) | latest stable via `rustup update` |
-| Python | 3.11 | 3.12 |
+| Tool | Minimum supported | Recommended for development | Actually tested (S1-02) |
+|---|---|---|---|
+| Node.js | 22.12.0+ | 24.x (Active LTS) | 24.19.0 |
+| Rust | 1.98.0 (pinned, see note) | latest stable via `rustup update` | 1.98.0 (`stable-x86_64-pc-windows-msvc`) |
+| Python | 3.11 | 3.12 | not applicable yet (no Python project exists — see S1-03/S1-06) |
 
-Rationale, checked against official sources as of 2026-09-15:
+Rationale:
 
-- **Node.js**: Vite (which the React/TypeScript frontend will use) currently requires
-  Node.js `20.19+` or `22.12+` — the `22.x` line only satisfies that from `22.12.0` onward, not
-  from `22.0.0`. Since Node 20.x is already at or past end-of-life while `22.x` remains under
-  Maintenance LTS (supported until 2027-04-30), the floor here is `22.12.0`, not a generic
-  `22.x`. Node 24.x is the current Active LTS line (supported until 2028-04-30) and is
-  recommended for development. Source: [Vite — Getting Started](https://vite.dev/guide/) and
-  the [Node.js Release schedule](https://github.com/nodejs/Release#readme). **This floor is not
-  final**: S1-02 selects the actual Tauri CLI/frontend dependencies and may require a higher
-  Node minimum than `22.12.0` — S1-02 must record and validate whatever floor its concrete
-  dependencies actually need.
-- **Rust**: no verified minimum is set here, because no Tauri project exists yet to test
-  against. Historically, Tauri v2 launched with a published upstream MSRV of 1.78
-  ([tauri-apps/tauri#11205](https://github.com/tauri-apps/tauri/pull/11205)), but that is an
-  upstream Tauri crate MSRV at a point in time, not a validated minimum for *this* project's
-  eventual dependency set, and Tauri's own Windows tooling has since needed a newer toolchain
-  than its published MSRV for specific build scenarios
-  ([tauri-apps/tauri#14433](https://github.com/tauri-apps/tauri/issues/14433)). Until S1-02
-  initializes the Tauri project and pins a toolchain, contributors should simply install the
-  latest stable Rust via [rustup](https://rustup.rs/). **S1-02 must record the Rust toolchain
-  version it builds/tests against and validate it against the dependencies it actually
-  selects** (e.g. via `rust-toolchain.toml` or CI), rather than this document asserting an
-  untested floor. See [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/).
-- **Python**: Python 3.10 is within a few weeks of losing even security support (its
-  end-of-life is 2026-10-31 per the [Python developer's guide release
-  cycle](https://devguide.python.org/versions/)), so it is not a safe floor for a project
-  starting now. Python 3.11 has security support until 2027-10-31, giving headroom for
-  Sprint 1 through Sprint 16. Python 3.12 is recommended for development because it has
-  support until 2028-10-31 and is the most broadly compatible version across the FastAPI /
-  SQLAlchemy / llama.cpp Python-binding ecosystem at time of writing; Python 3.13/3.14 are
-  newer but not yet the safest default for a project pulling in native-extension dependencies
-  (llama.cpp bindings) that tend to lag new interpreter releases.
+- **Node.js**: Vite (used by the `app/` frontend, see below) declares
+  `"engines": {"node": "^20.19.0 || >=22.12.0"}` in its own `package.json` — verified directly
+  against the installed `vite@8.3.0` package during S1-02, not just Vite's prose docs. Since
+  Node 20.x is already at or past end-of-life while `22.x` remains under Maintenance LTS
+  (supported until 2027-04-30), the floor is `22.12.0`. Node 24.x is the current Active LTS
+  line (supported until 2028-04-30); S1-02 was actually built and verified with Node `24.19.0`.
+  Source: `vite`'s published `package.json` `engines` field and the
+  [Node.js Release schedule](https://github.com/nodejs/Release#readme). A later ticket that adds
+  a frontend dependency with a higher declared Node requirement should raise this floor and
+  update this row, not silently rely on a newer Node than documented here.
+- **Rust**: S1-02 initialized the Tauri v2 project (`tauri` `2.11.5`, `tauri-cli` `2.11.4`) and
+  built/ran it successfully with Rust **1.98.0** stable
+  (`rustc 1.98.0 (88d9e12ae 2026-08-18)`, MSVC toolchain, `x86_64-pc-windows-msvc` target). That
+  exact version is pinned reproducibly in
+  [`app/src-tauri/rust-toolchain.toml`](app/src-tauri/rust-toolchain.toml), so `rustup` installs
+  and selects it automatically for anyone building `app/src-tauri`. This is the actually-tested
+  version, not a guess: `cargo check --locked` and a real `tauri dev` launch both passed against
+  it (see S1-02's PR for verification detail). Tauri v2 originally shipped with a lower
+  published upstream MSRV of 1.78
+  ([tauri-apps/tauri#11205](https://github.com/tauri-apps/tauri/pull/11205)), but that
+  historical figure was never validated against *this* project's actual dependency set and is
+  superseded by the pinned, tested `1.98.0` above — do not resurrect `1.78` as a claimed floor.
+  If a future ticket needs to lower the pin (e.g. for broader contributor compatibility), it
+  must re-verify the build against that lower version first.
+- **Python**: unchanged from S1-01 — no Python/FastAPI project exists yet (that's S1-03), so
+  there is nothing new to test here. Python 3.10 is within weeks of losing even security support
+  (end-of-life 2026-10-31 per the [Python developer's guide release
+  cycle](https://devguide.python.org/versions/)), so it remains an unsafe floor for a project
+  starting now; Python 3.11 (security support until 2027-10-31) is the documented minimum and
+  3.12 (until 2028-10-31) the recommended development version, pending S1-03 validating both
+  against whatever FastAPI/SQLAlchemy/llama.cpp-binding versions it actually selects.
 
 If these facts change (a version reaches end-of-life, or a dependency requires a newer
 floor), update this table rather than letting each project silently diverge.
 
 ## Windows development prerequisites (Tauri stack)
 
-These apply to contributors building the Tauri desktop shell on Windows, once
-`S1-02` initializes it. **Not yet exercised in this repository** — no Tauri project exists at
-this ticket's stage — this is documentation only, sourced from the
-[official Tauri v2 Windows prerequisites](https://v2.tauri.app/start/prerequisites/) and the
-[official Rust Windows install guidance](https://www.rust-lang.org/tools/install), checked
-2026-09-15.
+Sourced from the [official Tauri v2 Windows prerequisites](https://v2.tauri.app/start/prerequisites/)
+and the [official Rust Windows install guidance](https://www.rust-lang.org/tools/install),
+checked 2026-09-15. The developer-machine items below were actually exercised while building
+`app/` in S1-02 (a real Tauri window was launched and closed on Windows — see that PR for
+details); the end-user items are documentation only, since no packaged installer exists yet
+(that's S1-09).
 
 ### Developer machine requirements (building/running the app from source)
 
 - **Microsoft C++ Build Tools**: install the "Desktop development with C++" workload (via the
   Visual Studio Installer or the standalone Build Tools installer). Rust's MSVC toolchain
   depends on this.
-- **Rust with the MSVC toolchain**: install via [rustup](https://rustup.rs/) and ensure the
-  default host triple is an MSVC target (e.g. `x86_64-pc-windows-msvc`), not the GNU target.
-- **Node.js**: an LTS release (see table above) — only needed because the frontend is
-  React/TypeScript; Tauri itself does not require Node.
+- **Rust with the MSVC toolchain**: install via [rustup](https://rustup.rs/). `app/src-tauri`
+  pins its toolchain in `rust-toolchain.toml` (currently `1.98.0`, `x86_64-pc-windows-msvc`
+  target) — running any `cargo`/`tauri` command inside `app/src-tauri` makes `rustup`
+  auto-install and select that exact version, so no manual toolchain selection is needed beyond
+  having `rustup` itself installed.
+- **Node.js**: 22.12.0+ (see table above); tested with 24.19.0.
 - **WebView2 Runtime**: needed to build/run the app locally if it isn't already present. See
   end-user note below — most current Windows installs already have it.
 
@@ -115,9 +120,24 @@ this ticket's stage — this is documentation only, sourced from the
 
 ## What you can actually run today
 
-No application code exists yet (Sprint 0 was documentation/architecture only; this ticket,
-S1-01, adds only repository tooling config). There is currently no `npm install`, `cargo
-build`, `tauri dev`, or `pytest` to run — those commands become real starting with `S1-02`
-(Tauri shell), `S1-03` (FastAPI service), and `S1-06` (test runners), per
-[`docs/SPRINT_1_BACKLOG.md`](docs/SPRINT_1_BACKLOG.md). This document will be updated as those
-projects are initialized.
+The Tauri desktop shell (`app/`) exists as of S1-02: a minimal Tauri v2 + React + TypeScript
+project with Tailwind CSS v4 and shadcn/ui configured, rendering a static placeholder screen.
+**There is still no Python/FastAPI service, no backend IPC, and no database** — those are
+S1-03/S1-04, not this ticket. Do not run or expect any Python/`pytest` command yet.
+
+From the `app/` directory:
+
+```sh
+npm install       # install frontend dependencies (also required before any cargo/tauri command)
+npm run dev       # Vite dev server only (frontend in a browser, no Tauri window)
+npm run build     # tsc type check (noEmit, per tsconfig) + production Vite build to app/dist
+npm run tauri dev # launch the actual Tauri desktop window in dev mode (requires Rust prerequisites above)
+npm run tauri build # produce a release build/installer (not yet exercised end-to-end — see S1-09)
+```
+
+`cargo check`/`cargo build` also work directly from `app/src-tauri` once Node dependencies have
+been installed at least once (Tauri's build script reads the frontend's `dist/` output path from
+`tauri.conf.json`).
+
+No test runner is configured yet for either the frontend or (once it exists) the backend — that
+is S1-06's scope, not S1-02's. There is no rendering smoke test in `app/` for the same reason.

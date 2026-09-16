@@ -9,9 +9,11 @@ supported framework is **NIST SP 800-53 Revision 5**.
 
 ## Project Status
 
-**Sprint 0 — Architecture and Product Definition.** No application code exists yet. This
-repository currently contains product, architecture, security, and planning documentation only.
-See `docs/SPRINTS.md` for the full sprint plan and `docs/OPEN_QUESTIONS.md` for decisions still
+**Sprint 1 — Desktop Foundation.** Sprint 0 produced product, architecture, security, and
+planning documentation only. As of S1-02, a minimal Tauri v2 desktop shell with a React +
+TypeScript placeholder screen exists under [`app/`](app/) — it has no backend, no evidence
+handling, and no real feature screens yet. See `docs/SPRINT_1_BACKLOG.md` for what's in progress,
+`docs/SPRINTS.md` for the full sprint plan, and `docs/OPEN_QUESTIONS.md` for decisions still
 pending product-owner input.
 
 ## Privacy Philosophy
@@ -64,8 +66,8 @@ workflow and forbidden actions.
 ## Contributing / Environment Setup
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository tooling conventions, minimum/recommended
-Node.js/Rust/Python versions, and Windows development prerequisites for the planned Tauri
-stack.
+Node.js/Rust/Python versions, Windows development prerequisites for the Tauri stack, and the
+commands that actually work today.
 
 ## Technology (proposed, evaluated in `docs/ARCHITECTURE.md`)
 

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window. Empty on purpose: this placeholder screen never calls @tauri-apps/api or invoke(), so no ACL-gated command surface (including `core:default`'s bundled path/event/window/webview/app/image/resources/menu/tray defaults) is exercised, and granting `core:default` here would only add unused permission surface. Verified empirically by running `tauri dev` with an empty permissions array: the window opens, renders, and a normal titlebar close terminates the whole process tree (app.exe + all WebView2 helpers) with nothing orphaned (S1-02 review fix). No filesystem, shell, process, or opener permissions are granted either. A file-open-dialog permission and the ability to spawn exactly one child process (the local analysis service) are anticipated by docs/SPRINT_1_BACKLOG.md S1-02/S1-04/T-14, but are not implemented here — add them, and whichever `core:*` default sets the feature actually calls (e.g. `core:window:default` once window controls are used), only in the ticket that implements that behavior, scoped to that behavior alone.",
+  "windows": ["main"],
+  "permissions": []
+}
