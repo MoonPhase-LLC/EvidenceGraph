@@ -32,8 +32,10 @@ Commit each project's lockfile so builds are reproducible:
   lockfile is committed per Cargo's own guidance). Committed as of S1-02.
 - `app/package-lock.json` (npm was used as the package manager — already available with the
   Node.js install, no extra tooling required). Committed as of S1-02.
-- A Python lockfile appropriate to whatever dependency manager is chosen for the FastAPI
-  service (e.g. `uv.lock` or `poetry.lock`) — not yet applicable, pending S1-03.
+- `service/uv.lock` ([`uv`](https://docs.astral.sh/uv/) was chosen as the Python dependency
+  manager/lockfile format — already installed in this environment, no extra tooling required, and
+  its lockfile-by-default workflow matches the reproducibility approach already used for the other
+  two projects above). Committed as of S1-03.
 
 ## Minimum and recommended tool versions
 
@@ -43,11 +45,11 @@ documented in S1-01 before any project existed, and are now validated against th
 Tauri/React dependency set initialized in S1-02, so later tickets (starting with the Python/
 FastAPI service in S1-03) have a consistent baseline instead of each picking its own.
 
-| Tool | Minimum supported | Recommended for development | Actually tested (S1-02) |
+| Tool | Minimum supported | Recommended for development | Actually tested |
 |---|---|---|---|
-| Node.js | 22.12.0+ | 24.x (Active LTS) | 24.19.0 |
-| Rust | 1.98.0 (pinned, see note) | latest stable via `rustup update` | 1.98.0 (`stable-x86_64-pc-windows-msvc`) |
-| Python | 3.11 | 3.12 | not applicable yet (no Python project exists — see S1-03/S1-06) |
+| Node.js | 22.12.0+ | 24.x (Active LTS) | 24.19.0 (S1-02) |
+| Rust | 1.98.0 (pinned, see note) | latest stable via `rustup update` | 1.98.0 (`stable-x86_64-pc-windows-msvc`) (S1-02) |
+| Python | 3.11 | 3.12 | 3.12.7 (S1-03) |
 
 Rationale:
 
@@ -75,13 +77,16 @@ Rationale:
   superseded by the pinned, tested `1.98.0` above — do not resurrect `1.78` as a claimed floor.
   If a future ticket needs to lower the pin (e.g. for broader contributor compatibility), it
   must re-verify the build against that lower version first.
-- **Python**: unchanged from S1-01 — no Python/FastAPI project exists yet (that's S1-03), so
-  there is nothing new to test here. Python 3.10 is within weeks of losing even security support
-  (end-of-life 2026-10-31 per the [Python developer's guide release
+- **Python**: S1-03 initialized `service/` (FastAPI local service skeleton) and built/ran/tested
+  it successfully with Python **3.12.7** (via [`uv`](https://docs.astral.sh/uv/), which also pins
+  `.python-version` to `3.12` for local development). Python 3.10 is within weeks of losing even
+  security support (end-of-life 2026-10-31 per the [Python developer's guide release
   cycle](https://devguide.python.org/versions/)), so it remains an unsafe floor for a project
-  starting now; Python 3.11 (security support until 2027-10-31) is the documented minimum and
-  3.12 (until 2028-10-31) the recommended development version, pending S1-03 validating both
-  against whatever FastAPI/SQLAlchemy/llama.cpp-binding versions it actually selects.
+  starting now; Python 3.11 (security support until 2027-10-31) is the documented minimum
+  (`service/pyproject.toml` `requires-python = ">=3.11"`) and 3.12 (until 2028-10-31) is the
+  actually-tested recommended development version. S1-03 has not yet validated 3.11 itself, nor
+  SQLAlchemy/llama.cpp-binding versions, which are out of this ticket's scope (no database, no
+  model runtime yet).
 
 If these facts change (a version reaches end-of-life, or a dependency requires a newer
 floor), update this table rather than letting each project silently diverge.
@@ -121,9 +126,12 @@ details); the end-user items are documentation only, since no packaged installer
 ## What you can actually run today
 
 The Tauri desktop shell (`app/`) exists as of S1-02: a minimal Tauri v2 + React + TypeScript
-project with Tailwind CSS v4 and shadcn/ui configured, rendering a static placeholder screen.
-**There is still no Python/FastAPI service, no backend IPC, and no database** — those are
-S1-03/S1-04, not this ticket. Do not run or expect any Python/`pytest` command yet.
+project with Tailwind CSS v4 and shadcn/ui configured, rendering a static placeholder screen. The
+Python/FastAPI local service (`service/`) exists as of S1-03: a standalone, independently
+runnable authenticated skeleton with one `GET /health` endpoint. **The two are not yet wired
+together** — Tauri does not launch or supervise the service, and the frontend does not call it.
+That process-supervision/IPC integration is S1-04, not S1-02 or S1-03. There is still no
+database, no model runtime, and no real business-logic endpoint.
 
 From the `app/` directory:
 
@@ -139,5 +147,18 @@ npm run tauri build # produce a release build/installer (not yet exercised end-t
 been installed at least once (Tauri's build script reads the frontend's `dist/` output path from
 `tauri.conf.json`).
 
-No test runner is configured yet for either the frontend or (once it exists) the backend — that
-is S1-06's scope, not S1-02's. There is no rendering smoke test in `app/` for the same reason.
+From the `service/` directory (see `service/README.md` for full detail):
+
+```sh
+uv sync                                                               # install dependencies
+EVIDENCEGRAPH_SESSION_TOKEN=<any string, 16+ chars> uv run evidencegraph-service  # run the service
+uv run pytest             # backend test suite
+uv run ruff check .       # lint
+uv run ruff format --check .  # format check
+uv run mypy               # type check
+```
+
+No frontend test runner is configured yet (Vitest/Playwright) — that is S1-06's scope, not
+S1-02's or S1-03's. There is no rendering smoke test in `app/` for the same reason. `service/`'s
+own `pytest` suite (above) is this ticket's (S1-03's) required test coverage, not a placeholder
+awaiting S1-06 — S1-06 is expected to integrate it into cross-project tooling/CI, not create it.

@@ -1,0 +1,55 @@
+[project]
+name = "evidencegraph-service"
+version = "0.1.0"
+description = "EvidenceGraph local analysis service (Python/FastAPI, loopback-only, session-token authenticated)."
+authors = [
+    { name = "Mahin Moon", email = "124702885+Xirro9@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "pydantic-settings>=2.6,<3.0",
+    "uvicorn>=0.34,<0.35",
+]
+
+[project.scripts]
+evidencegraph-service = "evidencegraph_service:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<0.29",
+    "mypy>=1.13,<1.14",
+    "pytest>=8.3,<9.0",
+    "ruff>=0.8,<0.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101: `assert` is how pytest tests assert. S105/S106: fixed literal test
+# tokens are intentional, not real secrets. S104: test data deliberately
+# includes "0.0.0.0" as a case that must be *rejected*.
+"tests/**" = ["S101", "S104", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
