@@ -11,10 +11,13 @@ supported framework is **NIST SP 800-53 Revision 5**.
 
 **Sprint 1 — Desktop Foundation.** Sprint 0 produced product, architecture, security, and
 planning documentation only. As of S1-02, a minimal Tauri v2 desktop shell with a React +
-TypeScript placeholder screen exists under [`app/`](app/) — it has no backend, no evidence
-handling, and no real feature screens yet. See `docs/SPRINT_1_BACKLOG.md` for what's in progress,
-`docs/SPRINTS.md` for the full sprint plan, and `docs/OPEN_QUESTIONS.md` for decisions still
-pending product-owner input.
+TypeScript placeholder screen exists under [`app/`](app/). As of S1-03, a standalone, session-
+token-authenticated Python/FastAPI local service skeleton exists under
+[`service/`](service/), with one `GET /health` endpoint. **The two are not yet connected** — Tauri
+process supervision and frontend↔service IPC are S1-04 — and there is still no evidence handling,
+database, model runtime, or real feature screens. See `docs/SPRINT_1_BACKLOG.md` for what's in
+progress, `docs/SPRINTS.md` for the full sprint plan, and `docs/OPEN_QUESTIONS.md` for decisions
+still pending product-owner input.
 
 ## Privacy Philosophy
 
