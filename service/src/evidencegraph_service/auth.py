@@ -10,9 +10,11 @@ This is deliberately implemented as ASGI middleware, not a per-route
 `Depends()`, so a future route added without updating an allowlist is
 still protected by construction -- there is no opt-out mechanism here.
 D-025's bounded startup challenge is the sole pre-authentication protocol
-exception in the target architecture, and it is not implemented by this
-ticket (see `docs/SPRINT_1_BACKLOG.md` S1-03/S1-04): this service, as
-shipped here, has zero unauthenticated routes.
+exception, and S1-04 implements it as exactly one narrow, explicit
+exemption below (path + method + "is the challenge currently open" --
+never a blanket allowlist); every other route, including `/health`,
+remains unauthorized before credential installation, exactly as S1-03
+documented.
 
 Rejection logging and the ASGI-level exception handler (`app.py`) never
 touch `request.url` (or anything derived from it). Starlette builds that
@@ -20,13 +22,23 @@ URL by splicing the raw `Host` header into a string and re-parsing it with
 `urllib.parse.urlsplit`, which raises `ValueError` for a syntactically
 invalid authority (e.g. `Host: [non-IP-text]`) -- an unauthenticated,
 attacker-controlled header must never be able to make the auth path itself
-raise. `request.headers`/`request.method` are plain ASGI-scope reads and
-never trigger that parse.
+raise. `request.headers`/`request.method`/`request.scope["path"]` are
+plain ASGI-scope reads and never trigger that parse (the challenge-path
+comparison below deliberately uses `request.scope["path"]`, not
+`request.url.path`, for exactly this reason).
+
+Credential source: S1-03 originally read `Settings.session_token`
+directly. S1-04 needs the credential to be installable *after* the
+process has already started serving (supervised mode installs it over the
+private channel, only once the D-025 challenge succeeds), so this
+middleware now reads through a `credentials.CredentialStore` instead --
+see that module. Standalone mode is unaffected: `app.py` pre-populates a
+store from `Settings.session_token` at app-creation time, so every
+existing S1-03 code path and test sees byte-for-byte identical behavior.
 """
 
 from __future__ import annotations
 
-import hmac
 import logging
 from collections.abc import Awaitable, Callable
 
@@ -35,7 +47,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
-from .config import Settings
+from .challenge import StartupChallengeState
+from .credentials import CredentialStore
 
 logger = logging.getLogger("evidencegraph_service.auth")
 
@@ -74,13 +87,30 @@ _UNAUTHORIZED_BODY = {"detail": "Unauthorized"}
 
 
 class SessionTokenAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: ASGIApp, settings: Settings) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        credential_store: CredentialStore,
+        *,
+        challenge_path: str | None = None,
+        challenge_state: StartupChallengeState | None = None,
+    ) -> None:
         super().__init__(app)
-        self._settings = settings
+        self._credential_store = credential_store
+        # Both must be provided together for the exemption to ever apply --
+        # a `None` state (standalone mode, or supervised mode before the
+        # challenge state exists) means this middleware behaves exactly
+        # like S1-03's: zero exemptions, every path/method rejected the
+        # same way.
+        self._challenge_path = challenge_path
+        self._challenge_state = challenge_state
 
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
+        if self._is_open_challenge_request(request):
+            return await call_next(request)
+
         rejection_reason = self._rejection_reason(request)
         if rejection_reason is not None:
             # Fixed event name plus a reason drawn from a small, predefined
@@ -92,6 +122,27 @@ class SessionTokenAuthMiddleware(BaseHTTPMiddleware):
             )
         return await call_next(request)
 
+    def _is_open_challenge_request(self, request: Request) -> bool:
+        """The sole pre-authentication exemption (D-025): exactly `POST
+        <challenge_path>`, and only while the challenge is still open. Uses
+        `request.scope["path"]` -- never `request.url.path` -- so a
+        malformed `Host` header can't affect this comparison either. Once
+        the challenge closes (single-use success, expiry, attempts
+        exhausted, or explicit `close()` after credential install), this
+        always returns `False` again and the request falls through to the
+        same uniform rejection as any other unauthenticated request; the
+        route handler itself independently enforces the same "closed"
+        check too (`routes/challenge.py`), so there is no way to reach live
+        challenge behavior through this exemption after closure.
+        """
+        if self._challenge_state is None or self._challenge_path is None:
+            return False
+        if request.method != "POST":
+            return False
+        if request.scope.get("path") != self._challenge_path:
+            return False
+        return self._challenge_state.is_open
+
     def _rejection_reason(self, request: Request) -> str | None:
         """Returns None if authenticated, else a category string for logs.
 
@@ -100,7 +151,7 @@ class SessionTokenAuthMiddleware(BaseHTTPMiddleware):
         never `request.url`, so a malformed `Host` header (or any other
         request metadata) can never make this raise.
         """
-        if not self._settings.has_valid_credential_configured:
+        if not self._credential_store.is_installed:
             return "no_credential_configured"
 
         header = request.headers.get("authorization")
@@ -115,8 +166,7 @@ class SessionTokenAuthMiddleware(BaseHTTPMiddleware):
         if scheme.lower() != _AUTH_SCHEME_LOWER:
             return "malformed_authorization_header"
 
-        expected_token = self._settings.session_token.get_secret_value()  # type: ignore[union-attr]
-        if not hmac.compare_digest(supplied_token.encode("utf-8"), expected_token.encode("utf-8")):
+        if not self._credential_store.matches(supplied_token):
             return "token_mismatch"
 
         return None
