@@ -44,12 +44,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         # Minimal, constant response body regardless of the real error --
-        # never a stack trace, file path, or exception message. The
-        # exception *class name* only (no message/args, which could echo
-        # back request/config content) goes to the structured log.
+        # never a stack trace, file path, or exception message. Deliberately
+        # never touches `request.url` (or anything derived from it): building
+        # that property re-parses the raw `Host` header via
+        # `urllib.parse.urlsplit`, which raises `ValueError` for a
+        # syntactically invalid authority (e.g. `Host: [non-IP-text]`) -- a
+        # handler that runs *because something already failed* must not be
+        # able to fail the same way itself and turn a clean error response
+        # into an unhandled exception/traceback. `request.method` is a plain
+        # ASGI-scope read (no URL parsing) and the exception *class name*
+        # only (no message/args, which could echo back request/config
+        # content) goes to the structured log -- both bounded, predefined
+        # values, never attacker-controlled request content.
         logger.error(
             "unhandled_exception",
-            extra={"path": request.url.path, "exc_type": type(exc).__name__},
+            extra={"method": request.method, "exc_type": type(exc).__name__},
         )
         return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
 
