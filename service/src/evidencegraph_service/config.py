@@ -15,11 +15,12 @@ only the standalone/test entry point.
 
 from __future__ import annotations
 
-import re
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from . import b64url
 
 #: Below this length, a configured token is treated as invalid/absent
 #: configuration (fail closed) rather than a usable credential -- guards
@@ -27,14 +28,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 MIN_SESSION_TOKEN_LENGTH = 16
 
 #: The only accepted standalone credential shape: unpadded Base64URL
-#: (RFC 4648 SS5) -- `A-Z a-z 0-9 - _` only. This is a strict subset of the
-#: `token68` alphabet from RFC 9110 SS11.3, so a value that passes this
-#: check always round-trips cleanly through an `Authorization: Bearer <..>`
-#: header. It's also exactly the alphabet `secrets.token_urlsafe()`
-#: produces (see `service/README.md` for the generation command), so a
-#: cryptographically random credential is valid by construction -- no
-#: non-ASCII character, space, or control character ever matches.
-_TOKEN_ALPHABET_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+#: (RFC 4648 SS5) -- `A-Z a-z 0-9 - _` only (`b64url.TOKEN_PATTERN`). This
+#: is a strict subset of the `token68` alphabet from RFC 9110 SS11.3, so a
+#: value that passes this check always round-trips cleanly through an
+#: `Authorization: Bearer <..>` header. It's also exactly the alphabet
+#: `secrets.token_urlsafe()` produces (see `service/README.md` for the
+#: generation command), so a cryptographically random credential is valid
+#: by construction -- no non-ASCII character, space, or control character
+#: ever matches. Shared with the S1-04 private-channel/challenge encoding
+#: (`protocol.py`, `challenge.py`) so "what a valid credential looks like"
+#: can never drift between them.
+
+
+def is_valid_session_token_format(raw: str) -> bool:
+    """The one credential-format contract shared by every code path that
+    can install a session credential: the standalone env-var path
+    (`Settings.has_valid_credential_configured` below) and the supervised
+    runtime-installation path (`credentials.CredentialStore.install`,
+    S1-04). Keeping this in one place means S1-04 can never accidentally
+    define a looser/stricter format than S1-03 already validated and
+    documented (`service/README.md`).
+    """
+    return len(raw) >= MIN_SESSION_TOKEN_LENGTH and b64url.TOKEN_PATTERN.fullmatch(raw) is not None
+
 
 #: The literal, documented S1-03 bind address (`docs/SPRINT_1_BACKLOG.md`
 #: S1-03, `docs/ARCHITECTURE.md` SS4, `docs/SECURITY.md` T-09). Exactly this
@@ -90,17 +106,14 @@ class Settings(BaseSettings):
     def has_valid_credential_configured(self) -> bool:
         """True only if a session token is set, long enough, and header-safe.
 
-        "Header-safe" means it matches `_TOKEN_ALPHABET_PATTERN` (unpadded
-        Base64URL ASCII) -- see that constant's docstring for why. Does not
-        compare against any request -- see `auth.py` for the actual
-        constant-time credential check. Never logs or raises on an invalid
-        value; an unusable credential simply causes every request to be
-        rejected, the same fail-closed behavior as no credential at all.
+        "Header-safe" means it matches `is_valid_session_token_format`
+        (unpadded Base64URL ASCII) -- see that function's docstring for
+        why. Does not compare against any request -- see `auth.py` for the
+        actual constant-time credential check. Never logs or raises on an
+        invalid value; an unusable credential simply causes every request
+        to be rejected, the same fail-closed behavior as no credential at
+        all.
         """
         if self.session_token is None:
             return False
-        raw = self.session_token.get_secret_value()
-        return (
-            len(raw) >= MIN_SESSION_TOKEN_LENGTH
-            and _TOKEN_ALPHABET_PATTERN.fullmatch(raw) is not None
-        )
+        return is_valid_session_token_format(self.session_token.get_secret_value())

@@ -20,6 +20,59 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# S1-04 process supervision (docs/SPRINT_1_BACKLOG.md S1-04,
+# docs/DECISIONS.md D-018/D-025): spawning the local service child and
+# running the private-channel handshake concurrently with the HTTP
+# challenge round trip needs an async runtime with process/IO/timer
+# support. Tauri's own async runtime is already tokio-based, so this adds
+# the specific feature flags this crate uses directly rather than a new
+# runtime.
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "macros"] }
+# The D-025 challenge is an HTTP round trip Rust makes *to* the child --
+# never exposed to the frontend/WebView, so this is plain backend-only
+# usage, not the `tauri-plugin-http` capability surface. Already resolved
+# transitively in this workspace (see `Cargo.lock`); `default-features =
+# false` drops the TLS backend this loopback-only, plaintext-HTTP use has
+# no need for.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# D-025's domain-separated HMAC-SHA-256 challenge construction
+# (`supervisor/challenge.rs`, mirrors `service/src/evidencegraph_service/
+# challenge.py` byte-for-byte). Both already resolved transitively.
+hmac = "0.12"
+sha2 = "0.10"
+# Unpadded Base64URL (RFC 4648 SS5) is the one text encoding the
+# private-channel/challenge wire protocol uses for secret-bearing byte
+# fields -- matches `service/src/evidencegraph_service/b64url.py`
+# exactly. Already resolved transitively.
+base64 = "0.22"
+# Generates the startup secret, D-025 nonce, and D-009 session token --
+# all cryptographically random byte buffers. `OsRng` only; no other `rand`
+# API surface is used.
+rand = "0.8"
+# S1-04 review finding 1/2: idempotent shutdown coordination and cancelling
+# an in-progress startup without racing the "did we already publish Ready"
+# check. `CancellationToken` is the standard, official Tokio-project
+# primitive for exactly this (cheap to clone, `cancel()` is idempotent,
+# `cancelled()` resolves immediately if already cancelled) -- hand-rolling
+# the same guarantee with a bare `AtomicBool`+`Notify` is exactly the kind
+# of subtly-racy code this ticket's findings are about avoiding. Already
+# resolved transitively in this workspace.
+tokio-util = "0.7"
+
+# Windows-only: assigns the spawned child to a Job Object with
+# `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so an abnormal exit of this process
+# (crash, forced termination) still cannot leave the child orphaned, even
+# without this process getting to run its own graceful-shutdown code
+# (S1-04 requirement 7's "process guard ... mechanism"). Minimal raw FFI
+# bindings only -- not the higher-level `windows` crate -- for exactly the
+# handful of Win32 calls this needs. Already resolved transitively.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
