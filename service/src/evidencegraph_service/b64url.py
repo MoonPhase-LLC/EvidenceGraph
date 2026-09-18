@@ -39,7 +39,9 @@ def decode(value: object, *, field: str) -> bytes:
     """Strictly parses `value` as unpadded Base64URL. Rejects anything
     that isn't a non-empty, bounded-length string matching `TOKEN_PATTERN`
     *before* ever calling into the decoder -- never a best-effort decode
-    of untrusted input."""
+    of untrusted input. Also rejects a *padded* value: `TOKEN_PATTERN`
+    excludes `=`, so canonical unpadded encoding is the only accepted
+    textual form, not merely one this happens to produce."""
     if not isinstance(value, str) or not value or len(value) > MAX_FIELD_LENGTH:
         raise DecodeError(f"{field}_invalid_length")
     if not TOKEN_PATTERN.fullmatch(value):
@@ -49,3 +51,15 @@ def decode(value: object, *, field: str) -> bytes:
         return base64.urlsafe_b64decode(padded)
     except ValueError as exc:  # binascii.Error subclasses ValueError
         raise DecodeError(f"{field}_invalid_encoding") from exc
+
+
+def decode_exact(value: object, *, field: str, expected_length: int) -> bytes:
+    """As `decode`, but additionally requires the *decoded* byte length to
+    equal `expected_length` exactly -- e.g. a 32-byte startup secret, a
+    16-byte challenge nonce, a 32-byte HMAC-SHA-256 response. A
+    wrong-length value is never truncated/padded/accepted leniently; it is
+    rejected the same way a malformed one is."""
+    raw = decode(value, field=field)
+    if len(raw) != expected_length:
+        raise DecodeError(f"{field}_invalid_length")
+    return raw

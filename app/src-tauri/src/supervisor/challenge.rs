@@ -25,6 +25,11 @@ type HmacSha256 = Hmac<Sha256>;
 pub const DOMAIN_SEPARATOR: &[u8] = b"EvidenceGraph-S1-04-startup-challenge-v1";
 const FIELD_SEPARATOR: u8 = 0x00;
 
+/// Exact required decoded length of a challenge response -- the SHA-256
+/// digest size, matching `evidencegraph_service.challenge.RESPONSE_LENGTH`
+/// (S1-04 review finding 5: "require a 32-byte decoded HMAC response").
+pub const RESPONSE_LENGTH: usize = 32;
+
 /// The exact string both sides must byte-for-byte agree on for a given
 /// bound endpoint. Matches `evidencegraph_service.challenge.
 /// canonical_endpoint`.

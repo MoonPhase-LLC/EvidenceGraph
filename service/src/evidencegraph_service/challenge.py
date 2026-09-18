@@ -1,11 +1,8 @@
-"""D-025 domain-separated HMAC-SHA-256 startup identity challenge (S1-04).
-
-This module implements the *child's* half of `docs/DECISIONS.md` D-018/
-D-025's identity-verification handshake: Tauri (the parent) proves the
-process answering on the bound loopback port is the exact child it spawned
--- not an unrelated or impersonating process that happened to occupy the
-reported port -- before it will send that process any session credential
-or evidence.
+"""D-025 domain-separated HMAC-SHA-256 startup identity challenge (S1-04)
+-- Tauri's (parent) half. Mirrors
+`service/src/evidencegraph_service/challenge.py` byte-for-byte; that
+module's docstring is the canonical description of the exact byte
+construction:
 
 Exact byte construction (must match `app/src-tauri/src/supervisor/
 challenge.rs` byte-for-byte, or the two sides compute different HMACs over
@@ -23,7 +20,8 @@ identical inputs and every legitimate handshake fails closed):
   `config._REQUIRED_HOST` contract).
 - `nonce_bytes` is the *raw decoded bytes* of the nonce Tauri generated --
   never the Base64URL text itself -- so encoding choices on either side
-  can't change the signed content.
+  can't change the signed content. Must decode to exactly `NONCE_LENGTH`
+  bytes.
 - `0x00` field separators make the three-part construction unambiguous:
   none of the fields can ever contain a NUL byte, so there is exactly one
   way to have produced any given `message`.
@@ -37,10 +35,26 @@ This module only *computes* the response for a given nonce -- it never
 compares a response to anything, because the child is not the party doing
 the verifying. Tauri independently recomputes the same HMAC from its own
 copies of the secret/endpoint/nonce and compares in constant time on its
-side (`supervisor/challenge.rs`); this module's only defensive
-responsibility is refusing to compute *more than one* valid response for
-this child instance at all (see `StartupChallengeState`), which is what
-makes a captured (nonce, response) pair useless for replay.
+side (`supervisor/challenge.rs`); this module's own defensive
+responsibilities are:
+
+1. Refusing to compute *more than one* valid response for this child
+   instance at all (see `StartupChallengeState`), which is what makes a
+   captured (nonce, response) pair useless for replay.
+2. Doing so **atomically**: attempt accounting, the open/lifetime check,
+   nonce parsing, and HMAC computation all happen under a single lock
+   acquisition (`handle_request`) -- two concurrent requests can never
+   both observe "still open" and both go on to compute a valid response.
+   An earlier version of this module checked-then-released-the-lock
+   before computing, which allowed exactly that race; a concurrency
+   regression test (`tests/test_challenge.py::
+   test_concurrent_requests_produce_at_most_one_success`) pins this down.
+3. Counting *every* rejected request against the attempt budget,
+   including malformed JSON, wrong schema, and invalid encoding/length --
+   not just a well-formed-but-wrong nonce -- via `reject_malformed`,
+   called by `routes/challenge.py` for failures it detects (oversized
+   body, non-UTF-8, malformed JSON, wrong schema) before there is a
+   `nonce_b64` value to hand to `handle_request` at all.
 """
 
 from __future__ import annotations
@@ -57,9 +71,15 @@ from . import b64url
 DOMAIN_SEPARATOR = b"EvidenceGraph-S1-04-startup-challenge-v1"
 _FIELD_SEPARATOR = b"\x00"
 
+#: Exact required decoded lengths -- part of S1-04's strict wire schema.
+NONCE_LENGTH = 16
+RESPONSE_LENGTH = 32  # SHA-256 digest size; not independently configurable.
+
 #: "Bound ... allowed attempts, and startup lifetime" -- independent,
 #: defensive backstops on this side, not a substitute for Tauri's own
-#: overall startup timeout (`supervisor/mod.rs`).
+#: overall startup timeout (`supervisor/mod.rs`). Every request that
+#: reaches this route while open counts against `MAX_ATTEMPTS`, malformed
+#: or not -- see `reject_malformed`/`handle_request`.
 MAX_ATTEMPTS = 3
 MAX_LIFETIME_SECONDS = 30.0
 
@@ -111,6 +131,17 @@ class StartupChallengeState:
             return False
         return True
 
+    def _consume_attempt_locked(self) -> None:
+        """Caller must hold `self._lock`. Counts this call as one attempt
+        and proactively closes the challenge if it was the last one this
+        instance will ever accept -- shared by both the malformed-request
+        path (`reject_malformed`) and the well-formed path
+        (`handle_request`), so every request that reaches this state while
+        open, valid or not, consumes exactly one attempt."""
+        self._attempts += 1
+        if self._attempts >= MAX_ATTEMPTS:
+            self._open = False
+
     @property
     def is_open(self) -> bool:
         with self._lock:
@@ -121,46 +152,63 @@ class StartupChallengeState:
         with self._lock:
             return self._succeeded
 
-    def compute_response(self, *, nonce_b64: str) -> str:
+    def reject_malformed(self) -> None:
+        """Records one consumed attempt for a request the caller (the HTTP
+        route) already knows is malformed before it has a `nonce_b64`
+        value to hand to `handle_request` -- an oversized body, non-UTF-8
+        bytes, invalid JSON, a duplicate/unknown key, or a wrong-typed
+        `nonce` field. Raises `ChallengeError("challenge_not_open")` if
+        the challenge was already closed, exactly like `handle_request`,
+        so callers can use the same except-and-400 handling either way.
+        """
+        with self._lock:
+            if not self._open_locked():
+                raise ChallengeError("challenge_not_open")
+            self._consume_attempt_locked()
+
+    def handle_request(self, *, nonce_b64: str) -> str:
         """Computes and returns the Base64URL(unpadded) HMAC response for
         `nonce_b64`. This is a **single-use** operation: the challenge
         closes itself the moment it produces one successful response, so a
         captured (nonce, response) pair can never be replayed against this
         route again, and a second legitimate-looking request (race,
         retry, or attacker) after the first success is rejected the same
-        way a stale/expired one is. Raises `ChallengeError` for a closed/
-        expired/attempts-exhausted challenge or a malformed nonce; consumes
-        one attempt for any request accepted past the open/lifetime check,
-        regardless of whether the nonce itself turns out to be malformed.
+        way a stale/expired one is.
+
+        The open check, attempt accounting, nonce decode/length
+        validation, and HMAC computation all happen under one held lock --
+        not released and reacquired between steps -- so two concurrent
+        calls can never both observe "still open" and both go on to
+        produce a valid response (see module docstring point 2 and
+        `tests/test_challenge.py::
+        test_concurrent_requests_produce_at_most_one_success`).
+
+        Raises `ChallengeError` for a closed/expired/attempts-exhausted
+        challenge or a malformed/wrong-length nonce; consumes one attempt
+        for any request accepted past the open/lifetime check, regardless
+        of whether the nonce itself turns out to be malformed.
         """
         with self._lock:
             if not self._open_locked():
                 raise ChallengeError("challenge_not_open")
-            self._attempts += 1
-            if self._attempts >= MAX_ATTEMPTS:
-                # This is the last attempt this challenge will ever accept,
-                # succeed or fail -- close proactively (before releasing
-                # the lock) so a concurrent caller can't sneak in one more
-                # attempt while this one is still being computed.
-                self._open = False
+            self._consume_attempt_locked()
 
-        try:
-            nonce = b64url.decode(nonce_b64, field="nonce")
-        except b64url.DecodeError as exc:
-            raise ChallengeError(str(exc)) from exc
-        response = _compute_response(secret=self._secret, endpoint=self._endpoint, nonce=nonce)
+            try:
+                nonce = b64url.decode_exact(nonce_b64, field="nonce", expected_length=NONCE_LENGTH)
+            except b64url.DecodeError as exc:
+                raise ChallengeError(str(exc)) from exc
 
-        with self._lock:
+            response = _compute_response(secret=self._secret, endpoint=self._endpoint, nonce=nonce)
             self._succeeded = True
             self._open = False  # single-use: this was the one valid response.
 
-        return b64url.encode(response)
+            return b64url.encode(response)
 
     def close(self) -> None:
         """Idempotent, explicit close -- called once the resulting session
         token is actually installed (`supervised.py`), as a second,
         independent enforcement of "permanently close the challenge route
         once authentication becomes ready" on top of the single-use
-        self-close in `compute_response`."""
+        self-close in `handle_request`."""
         with self._lock:
             self._open = False

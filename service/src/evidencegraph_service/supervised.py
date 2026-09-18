@@ -161,45 +161,56 @@ def main() -> None:
     except protocol.ProtocolError:
         _fail("internal_error")
 
-    settings = Settings(host=host, port=port, session_token=None)
-    credential_store = CredentialStore()
-    challenge_state = StartupChallengeState(secret=secret, host=host, port=port)
+    try:
+        settings = Settings(host=host, port=port, session_token=None)
+        credential_store = CredentialStore()
+        challenge_state = StartupChallengeState(secret=secret, host=host, port=port)
 
-    app = create_app(
-        settings,
-        credential_store=credential_store,
-        startup_challenge=challenge_state,
-        supervised=True,
-    )
+        app = create_app(
+            settings,
+            credential_store=credential_store,
+            startup_challenge=challenge_state,
+            supervised=True,
+        )
 
-    logger.info(
-        "supervised_starting",
-        extra={"host": host, "port": port, "environment": settings.environment},
-    )
+        logger.info(
+            "supervised_starting",
+            extra={"host": host, "port": port, "environment": settings.environment},
+        )
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    server = uvicorn.Server(config)
-    outcome = _ProtocolOutcome()
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        outcome = _ProtocolOutcome()
 
-    protocol_thread = threading.Thread(
-        target=_protocol_loop,
-        kwargs={
-            "credential_store": credential_store,
-            "challenge_state": challenge_state,
-            "server": server,
-            "outcome": outcome,
-        },
-        daemon=True,
-        name="evidencegraph-private-channel",
-    )
-    protocol_thread.start()
+        protocol_thread = threading.Thread(
+            target=_protocol_loop,
+            kwargs={
+                "credential_store": credential_store,
+                "challenge_state": challenge_state,
+                "server": server,
+                "outcome": outcome,
+            },
+            daemon=True,
+            name="evidencegraph-private-channel",
+        )
+        protocol_thread.start()
 
-    asyncio.run(server.serve(sockets=[sock]))
-    # By the time `serve()` has returned, whichever code path set
-    # `server.should_exit` has already finished running (it does nothing
-    # after setting that flag) -- this join is a bounded belt-and-braces
-    # wait, not the actual synchronization point.
-    protocol_thread.join(timeout=5.0)
+        asyncio.run(server.serve(sockets=[sock]))
+        # By the time `serve()` has returned, whichever code path set
+        # `server.should_exit` has already finished running (it does
+        # nothing after setting that flag) -- this join is a bounded
+        # belt-and-braces wait, not the actual synchronization point.
+        protocol_thread.join(timeout=5.0)
+    except Exception:
+        # Never let an unexpected exception propagate out of `main()`
+        # uncaught: Python's default handling for that would print a full
+        # traceback (file/line/exception-message chain, potentially
+        # echoing back something derived from a malformed message or
+        # local state) to stderr just before exiting. A fixed, bounded
+        # reason and a non-zero exit code carry the same "something went
+        # wrong" signal to the parent without that risk.
+        logger.error("supervised_unexpected_failure", extra={})
+        raise SystemExit(_STARTUP_ERROR_EXIT_CODE) from None
 
     logger.info("supervised_stopped", extra={"clean_shutdown": outcome.clean_shutdown})
     if not outcome.clean_shutdown:

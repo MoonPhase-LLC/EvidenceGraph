@@ -49,6 +49,15 @@ base64 = "0.22"
 # all cryptographically random byte buffers. `OsRng` only; no other `rand`
 # API surface is used.
 rand = "0.8"
+# S1-04 review finding 1/2: idempotent shutdown coordination and cancelling
+# an in-progress startup without racing the "did we already publish Ready"
+# check. `CancellationToken` is the standard, official Tokio-project
+# primitive for exactly this (cheap to clone, `cancel()` is idempotent,
+# `cancelled()` resolves immediately if already cancelled) -- hand-rolling
+# the same guarantee with a bare `AtomicBool`+`Notify` is exactly the kind
+# of subtly-racy code this ticket's findings are about avoiding. Already
+# resolved transitively in this workspace.
+tokio-util = "0.7"
 
 # Windows-only: assigns the spawned child to a Job Object with
 # `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so an abnormal exit of this process

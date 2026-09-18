@@ -357,4 +357,42 @@ def test_no_secret_or_probe_content_and_no_traceback_in_logs(tauri: _FakeTauri) 
     assert VALID_TOKEN not in combined
     assert b64url.encode(nonce) not in combined
     assert "Traceback" not in combined
+
+
+_SECRET_MARKER = "MARKER-SECRET-VALUE-DO-NOT-LEAK-9f3a7c1e"
+
+
+def test_secret_markers_in_malformed_frames_never_appear_in_logs() -> None:
+    """S1-04 review finding 4 regression test: place a recognizable
+    synthetic value inside *every* interesting field of a malformed first
+    message and confirm it never surfaces in captured stdout/stderr. An
+    earlier version of this code built `ProtocolError`/log messages with
+    f-strings embedding the received `type` or field content directly
+    (e.g. `f"expected_startup_secret_got_{message['type']}"`); this drives
+    a marker through each of those historical injection points and proves
+    none of them echo it back.
+    """
+    malformed_frames: list[dict[str, object]] = [
+        {"v": 1, "type": _SECRET_MARKER, "secret": "A" * 43},  # marker as `type`
+        {"v": 1, "type": "startup_secret", "secret": _SECRET_MARKER},  # marker as `secret`
+        {  # marker as an unexpected extra field
+            "v": 1,
+            "type": "startup_secret",
+            "secret": "A" * 43,
+            "extra": _SECRET_MARKER,
+        },
+        {"v": _SECRET_MARKER, "type": "startup_secret", "secret": "A" * 43},  # marker as `v`
+    ]
+
+    for frame in malformed_frames:
+        fake = _FakeTauri(process=_spawn())
+        try:
+            fake.send_raw(frame)
+            fake.process.wait(timeout=_READY_TIMEOUT_SECONDS)
+        finally:
+            fake.terminate_and_capture()
+
+        combined = fake.stdout_text + fake.stderr_text
+        assert _SECRET_MARKER not in combined, f"marker leaked for frame {frame!r}"
+        assert "Traceback" not in combined
     assert "ValueError" not in combined

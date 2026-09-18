@@ -3,9 +3,12 @@
 //! startup/shutdown contract. The frontend never receives the session
 //! token or the raw HTTP connection -- it only ever sees a
 //! [`supervisor::SupervisorState`] snapshot and the result of
-//! [`check_service_health`], both narrowly-scoped `#[tauri::command]`s
-//! (see that function's docs for why this is the smaller exposed
-//! capability versus letting the WebView call the service directly).
+//! [`check_service_health`], both narrowly-scoped `#[tauri::command]`s.
+//! `check_service_health` is a thin wrapper over
+//! [`supervisor::check_service_health`] (see that function's docs for why
+//! this design -- a Rust-side request, never a WebView `fetch` -- was
+//! chosen, and for the child-death/stale-connection race it specifically
+//! guards against).
 //!
 //! `supervisor::start`/`shutdown` touch only in-memory state
 //! (`SupervisorHandle`), with no Tauri event emission built in -- kept
@@ -17,7 +20,9 @@
 
 mod supervisor;
 
-use supervisor::{SupervisorHandle, SupervisorState};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use supervisor::{HealthCheckError, HealthResponse, SupervisorHandle, SupervisorState};
 use tauri::Manager;
 
 /// Read-only snapshot of the current supervisor state -- safe to call at
@@ -31,53 +36,42 @@ async fn get_service_status(
 }
 
 /// The one narrowly-scoped command that actually talks to the local
-/// service, on the frontend's behalf, entirely in Rust: performs a single
-/// authenticated `GET /health` request using the connection/token
-/// [`SupervisorHandle::ready_connection`] holds, and returns the parsed
-/// JSON body or a sanitized error string. This satisfies S1-04's
-/// "frontend-to-service authenticated health round trip" requirement
-/// without ever handing the session token, host, or port to the WebView's
-/// JavaScript context -- the smaller exposed capability versus the
-/// alternative (giving the frontend the raw connection details and
-/// loosening CSP `connect-src` to let it call the service directly),
-/// which is also why no CORS configuration is needed on the FastAPI side
-/// for this at all (a same-process Rust HTTP client never sends an
-/// `Origin` header, so CORS is not the relevant boundary here -- the
-/// session-token check is). Returns `Err("service_not_ready")` -- never a
-/// stale/partial connection -- if called before the state is `Ready`.
+/// service, on the frontend's behalf, entirely in Rust. See
+/// `supervisor::check_service_health`'s docs for the full request/
+/// liveness-check contract. Returns a sanitized, fixed error string --
+/// never handing the session token, host, port, or a raw HTTP/parse
+/// error to the WebView's JavaScript context, which is also the smaller
+/// exposed capability versus the alternative (giving the frontend the
+/// raw connection details and loosening CSP `connect-src` to let it call
+/// the service directly) -- and is also why no CORS configuration is
+/// needed on the FastAPI side at all (a same-process Rust HTTP client
+/// never sends an `Origin` header, so CORS is not the relevant boundary
+/// here -- the session-token check is).
 #[tauri::command]
 async fn check_service_health(
     state: tauri::State<'_, SupervisorHandle>,
-) -> Result<serde_json::Value, String> {
-    let connection = state
-        .ready_connection()
+) -> Result<HealthResponse, String> {
+    let connection = match state.ready_connection().await {
+        Some(connection) => connection,
+        None => return Err(HealthCheckError::ServiceNotReady.as_str().to_string()),
+    };
+    supervisor::check_service_health(&connection)
         .await
-        .ok_or_else(|| "service_not_ready".to_string())?;
-    let url = format!("http://{}:{}/health", connection.host, connection.port);
-    let response = connection
-        .http_client
-        .get(&url)
-        .bearer_auth(&connection.token)
-        .send()
-        .await
-        .map_err(|_| "health_request_failed".to_string())?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "health_request_unexpected_status_{}",
-            response.status().as_u16()
-        ));
-    }
-
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|_| "health_response_not_json".to_string())
+        .map_err(|e| e.as_str().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let supervisor_handle = SupervisorHandle::new();
+    // S1-04 review finding 2: guards `RunEvent::ExitRequested`, which can
+    // fire more than once (e.g. a user clicking the titlebar close button
+    // repeatedly before the app actually exits) -- only the *first*
+    // firing spawns the shutdown+exit task; every later one is a no-op.
+    // `supervisor::shutdown` is independently idempotent too (see its own
+    // docs), so this is defense in depth, not the only thing making
+    // repeated close requests safe -- but it also avoids spawning a pile
+    // of redundant tasks for no reason.
+    let shutdown_initiated = Arc::new(AtomicBool::new(false));
 
     let app = tauri::Builder::default()
         .manage(supervisor_handle.clone())
@@ -101,8 +95,27 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+    app.run(move |app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+            // `ExitRequested` fires twice in the real exit path: once
+            // naturally (`code: None`, e.g. the user closed the window)
+            // -- the one we want to intercept to run cleanup first -- and
+            // again when *this handler's own* `app_handle.exit(0)` call
+            // below re-enters the event loop (`code: Some(0)`). Calling
+            // `api.prevent_exit()` unconditionally on every
+            // `ExitRequested` event was a real bug this project hit: it
+            // prevented that second, self-generated exit too, so the
+            // process never actually terminated -- confirmed by manual
+            // testing (Windows process list showed `app.exe` still
+            // running, "Responding", nearly a minute after a clean
+            // graceful shutdown had already completed and logged
+            // successfully). A `Some(code)` exit request is always our
+            // own follow-through, never a fresh request to intercept, so
+            // it must be allowed to proceed.
+            if code.is_some() {
+                return;
+            }
+
             // Prevent the default immediate exit so the graceful
             // shutdown sequence (private-channel `shutdown` message,
             // bounded grace period, then a forced kill if needed) can run
@@ -110,6 +123,11 @@ pub fn run() {
             // immediately ... wait for a bounded grace period ...
             // forcefully terminate ... if graceful shutdown fails."
             api.prevent_exit();
+
+            if shutdown_initiated.swap(true, Ordering::SeqCst) {
+                return; // already handling a previous close request
+            }
+
             let handle = app_handle.state::<SupervisorHandle>().inner().clone();
             let app_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {

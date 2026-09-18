@@ -121,7 +121,7 @@ def test_closing_the_state_directly_also_closes_the_route() -> None:
     assert response.status_code == 404
 
 
-def test_malformed_json_body_rejected_without_consuming_success() -> None:
+def test_malformed_json_body_rejected_without_a_success() -> None:
     client, state, _ = _supervised_client()
 
     response = client.post(
@@ -129,8 +129,12 @@ def test_malformed_json_body_rejected_without_consuming_success() -> None:
     )
 
     assert response.status_code == 400
-    assert state.is_open is True  # malformed body never reaches compute_response
+    # Still open -- one malformed request consumes one of MAX_ATTEMPTS(3),
+    # it does not close the challenge by itself (see the exhaustion test
+    # below for what happens once the budget really is used up).
+    assert state.is_open is True
     assert state.succeeded is False
+    assert state._attempts == 1
 
 
 def test_missing_nonce_field_rejected() -> None:
@@ -155,6 +159,54 @@ def test_oversized_body_rejected() -> None:
     response = client.post(CHALLENGE_PATH, json={"nonce": "A" * 10_000})
 
     assert response.status_code == 400
+
+
+def test_duplicate_nonce_key_rejected() -> None:
+    client, state, _ = _supervised_client()
+
+    response = client.post(
+        CHALLENGE_PATH,
+        content=b'{"nonce":"AAAAAAAAAAAAAAAAAAAAAA","nonce":"BBBBBBBBBBBBBBBBBBBBBB"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert state._attempts == 1
+
+
+def test_unknown_extra_key_rejected() -> None:
+    client, _, _ = _supervised_client()
+
+    response = client.post(CHALLENGE_PATH, json={"nonce": _valid_nonce(), "evidence": "extra"})
+
+    assert response.status_code == 400
+
+
+# --- S1-04 review finding 6: malformed requests count toward the budget ----
+
+
+def test_malformed_requests_alone_exhaust_the_attempt_budget_and_close_the_route() -> None:
+    """An attacker sending nothing but malformed bodies still exhausts
+    `MAX_ATTEMPTS` and permanently closes the route -- they don't get
+    unlimited free probing before the well-formed-nonce guessing budget
+    starts counting down."""
+    client, state, _ = _supervised_client()
+    assert state.succeeded is False
+
+    for _ in range(3):  # StartupChallengeState.MAX_ATTEMPTS
+        response = client.post(
+            CHALLENGE_PATH, content=b"not json", headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 400
+
+    assert state.is_open is False
+    assert state.succeeded is False
+
+    # Even a well-formed, correct nonce is now rejected -- the budget, not
+    # correctness, decided this. Unauthenticated + closed looks like any
+    # other 401 (see `test_challenge_route_closed_after_one_success`).
+    final = client.post(CHALLENGE_PATH, json={"nonce": _valid_nonce()})
+    assert final.status_code == 401
 
 
 def test_challenge_response_never_leaks_the_startup_secret() -> None:

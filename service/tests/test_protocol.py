@@ -187,6 +187,106 @@ def test_write_error_falls_back_to_internal_error_for_unknown_reason() -> None:
     assert message == {"v": 1, "type": "error", "reason": "internal_error"}
 
 
+# --- S1-04 review finding 5: strict wire schema -----------------------------
+
+
+def _raw_frame(payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + payload
+
+
+def test_read_frame_rejects_duplicate_v_key() -> None:
+    buf = io.BytesIO(_raw_frame(b'{"v":1,"v":1,"type":"ready"}'))
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_frame(buf)
+
+
+def test_read_frame_rejects_duplicate_type_key() -> None:
+    buf = io.BytesIO(_raw_frame(b'{"v":1,"type":"ready","type":"shutdown"}'))
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_frame(buf)
+
+
+def test_read_frame_rejects_duplicate_key_in_a_typed_field() -> None:
+    """Not just `v`/`type` -- any duplicate key anywhere in the object."""
+    buf = io.BytesIO(
+        _raw_frame(b'{"v":1,"type":"startup_secret","secret":"AAAA","secret":"BBBBBBBBBBBBBBBB"}')
+    )
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_startup_secret(buf)
+
+
+@pytest.mark.parametrize("version", [True, False])
+def test_read_frame_rejects_boolean_version(version: bool) -> None:
+    """`True == 1` in Python -- a naive `value == PROTOCOL_VERSION` check
+    (or `isinstance(value, int)`, since `bool` subclasses `int`) would
+    incorrectly accept `{"v": true}` as protocol version 1."""
+    buf = io.BytesIO(_raw_json_frame({"v": version, "type": "ready"}))
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_frame(buf)
+
+
+def test_read_frame_rejects_float_version() -> None:
+    buf = io.BytesIO(_raw_json_frame({"v": 1.0, "type": "ready"}))
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_frame(buf)
+
+
+def test_read_frame_rejects_string_version() -> None:
+    buf = io.BytesIO(_raw_json_frame({"v": "1", "type": "ready"}))
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_frame(buf)
+
+
+@pytest.mark.parametrize("length", [0, 1, 16, 31, 33, 64])
+def test_read_startup_secret_rejects_wrong_length_secret(length: int) -> None:
+    wrong_length_secret = b64url.encode(bytes(length))
+    buf = io.BytesIO()
+    protocol.write_frame(buf, {"v": 1, "type": "startup_secret", "secret": wrong_length_secret})
+    buf.seek(0)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_startup_secret(buf)
+
+
+def test_read_startup_secret_rejects_unknown_extra_key() -> None:
+    buf = io.BytesIO()
+    protocol.write_frame(
+        buf,
+        {"v": 1, "type": "startup_secret", "secret": VALID_SECRET, "extra": "field"},
+    )
+    buf.seek(0)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_startup_secret(buf)
+
+
+def test_read_install_session_token_rejects_unknown_extra_key() -> None:
+    buf = io.BytesIO()
+    protocol.write_frame(
+        buf,
+        {"v": 1, "type": "install_session_token", "token": VALID_TOKEN, "extra": "field"},
+    )
+    buf.seek(0)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_install_token_or_shutdown(buf)
+
+
+def test_read_shutdown_rejects_extra_token_field() -> None:
+    """A real `shutdown` message never carries a `token` -- one that does
+    is rejected, not silently accepted with the field ignored."""
+    buf = io.BytesIO()
+    protocol.write_frame(buf, {"v": 1, "type": "shutdown", "token": VALID_TOKEN})
+    buf.seek(0)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_install_token_or_shutdown(buf)
+
+
+def test_read_install_token_or_shutdown_rejects_boolean_version() -> None:
+    buf = io.BytesIO(
+        _raw_json_frame({"v": True, "type": "install_session_token", "token": VALID_TOKEN})
+    )
+    with pytest.raises(protocol.ProtocolError):
+        protocol.read_install_token_or_shutdown(buf)
+
+
 def test_multiple_frames_can_be_read_sequentially() -> None:
     """Simulates the real ordered exchange over one continuous stream."""
     buf = io.BytesIO()
