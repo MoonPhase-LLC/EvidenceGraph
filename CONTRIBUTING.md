@@ -126,12 +126,18 @@ details); the end-user items are documentation only, since no packaged installer
 ## What you can actually run today
 
 The Tauri desktop shell (`app/`) exists as of S1-02: a minimal Tauri v2 + React + TypeScript
-project with Tailwind CSS v4 and shadcn/ui configured, rendering a static placeholder screen. The
-Python/FastAPI local service (`service/`) exists as of S1-03: a standalone, independently
-runnable authenticated skeleton with one `GET /health` endpoint. **The two are not yet wired
-together** — Tauri does not launch or supervise the service, and the frontend does not call it.
-That process-supervision/IPC integration is S1-04, not S1-02 or S1-03. There is still no
-database, no model runtime, and no real business-logic endpoint.
+project with Tailwind CSS v4 and shadcn/ui configured. The Python/FastAPI local service
+(`service/`) exists as of S1-03: a standalone, independently runnable authenticated skeleton with
+one `GET /health` endpoint. As of S1-04, **the two are wired together**: on launch, Tauri spawns
+the service (an explicit absolute path only, never PATH/a shell), completes the full D-018/D-025
+identity-verification handshake over private stdio pipes plus a one-time HTTP challenge, installs a
+fresh per-launch session credential, and only then lets the frontend poll status and call the
+authenticated `/health` round trip (via a narrowly-scoped Tauri command — the frontend itself never
+receives the token). See [`app/README.md`](app/README.md) and
+`app/src-tauri/src/supervisor/mod.rs` for the full contract. Dev-mode supervision requires `uv
+sync` to have been run in `service/` first (see below); a release build's bundled sidecar
+executable doesn't exist until S1-09 ships it, so packaged builds fail closed today, not
+silently. There is still no database, no model runtime, and no real business-logic endpoint.
 
 From the `app/` directory:
 
@@ -145,7 +151,17 @@ npm run tauri build # produce a release build/installer (not yet exercised end-t
 
 `cargo check`/`cargo build` also work directly from `app/src-tauri` once Node dependencies have
 been installed at least once (Tauri's build script reads the frontend's `dist/` output path from
-`tauri.conf.json`).
+`tauri.conf.json`). Also from `app/src-tauri`:
+
+```sh
+cargo test                                             # unit + real-process integration tests
+cargo clippy --all-targets --all-features -- -D warnings  # lint
+cargo fmt --check                                      # format check
+```
+
+The `supervisor` module's real-process tests (`cargo test`) spawn the actual `service/.venv`
+Python interpreter, so `uv sync` must have been run in `service/` first, same prerequisite as
+`npm run tauri dev`.
 
 From the `service/` directory (see `service/README.md` for full detail):
 

@@ -20,6 +20,72 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# S1-04 process supervision (docs/SPRINT_1_BACKLOG.md S1-04,
+# docs/DECISIONS.md D-018/D-025): spawning the local service child and
+# running the private-channel handshake concurrently with the HTTP
+# challenge round trip needs an async runtime with process/IO/timer
+# support. Tauri's own async runtime is already tokio-based, so this adds
+# the specific feature flags this crate uses directly rather than a new
+# runtime. `net` (TcpStream, used by `supervisor/pinned_http.rs`) was
+# previously enabled only implicitly by `reqwest` via feature unification;
+# it is declared explicitly now that `reqwest` is no longer a dependency of
+# this crate (D-026).
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "macros", "net"] }
+# S1-04 review round 2, finding 1: the D-025 challenge response and every
+# subsequent authenticated request (the `/health` check) are now sent over
+# one explicitly owned TCP connection, opened exactly once per launch and
+# never redialed -- see `supervisor/pinned_http.rs` module docs and
+# `docs/DECISIONS.md` D-026 for why a pooled/auto-redialing HTTP client
+# (this crate's previous `reqwest`-based design) could not give that
+# guarantee. `hyper`'s low-level client connection API is what makes a
+# single, explicitly-driven, never-reconnecting connection possible;
+# `hyper-util`/`http-body-util`/`bytes` are the minimal companion crates
+# its API requires (Tokio I/O adapter, request/response body types).
+# `default-features = false` on each drops unused TLS/HTTP2/server-side
+# feature surface. All four are already resolved transitively in this
+# workspace via other dependencies.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# D-025's domain-separated HMAC-SHA-256 challenge construction
+# (`supervisor/challenge.rs`, mirrors `service/src/evidencegraph_service/
+# challenge.py` byte-for-byte). Both already resolved transitively.
+hmac = "0.12"
+sha2 = "0.10"
+# Unpadded Base64URL (RFC 4648 SS5) is the one text encoding the
+# private-channel/challenge wire protocol uses for secret-bearing byte
+# fields -- matches `service/src/evidencegraph_service/b64url.py`
+# exactly. Already resolved transitively.
+base64 = "0.22"
+# Generates the startup secret, D-025 nonce, and D-009 session token --
+# all cryptographically random byte buffers. `OsRng` only; no other `rand`
+# API surface is used.
+rand = "0.8"
+# S1-04 review finding 1/2: idempotent shutdown coordination and cancelling
+# an in-progress startup without racing the "did we already publish Ready"
+# check. `CancellationToken` is the standard, official Tokio-project
+# primitive for exactly this (cheap to clone, `cancel()` is idempotent,
+# `cancelled()` resolves immediately if already cancelled) -- hand-rolling
+# the same guarantee with a bare `AtomicBool`+`Notify` is exactly the kind
+# of subtly-racy code this ticket's findings are about avoiding. Already
+# resolved transitively in this workspace.
+tokio-util = "0.7"
+
+# Windows-only: assigns the spawned child to a Job Object with
+# `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so an abnormal exit of this process
+# (crash, forced termination) still cannot leave the child orphaned, even
+# without this process getting to run its own graceful-shutdown code
+# (S1-04 requirement 7's "process guard ... mechanism"). Minimal raw FFI
+# bindings only -- not the higher-level `windows` crate -- for exactly the
+# handful of Win32 calls this needs. Already resolved transitively.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -475,7 +475,11 @@ evidence-derived prompt content — without ever touching FastAPI's own auth. Se
 
 ## D-018: Fail-closed service-identity verification before sending credentials or evidence
 
-**Status:** Accepted
+**Status:** Accepted, amended by D-025 and D-026
+
+**Note (added by D-026):** Identity verification proves the peer at startup only. Later
+credential-bearing requests must be sent over that same verified connection and never over a
+redialed one; see D-026.
 
 **Context:** D-009 authenticates *callers* of the local FastAPI service. It does not authenticate
 the *service* to the frontend. `ARCHITECTURE.md` §4 and `OPEN_QUESTIONS.md` A-1 already flagged
@@ -843,6 +847,86 @@ lacked ownership/uniqueness rules, and Sprint 1 sign-off did not depend on its p
 **Consequences:** Documentation and proposed schema only. No application code, new dependencies,
 or migration is introduced. Earlier ADR history remains historical where explicitly superseded;
 the amended subsystem docs and this contract govern implementation.
+
+---
+
+## D-026: Credential-bearing requests travel only over the identity-verified connection (no redial)
+
+**Status:** Accepted. Amends D-018 and D-025 (S1-04 review round 2, finding 1).
+
+**Context:** D-018/D-025 verify the service's identity once, at startup, by challenge/response over
+the child's HTTP endpoint. That proves who answered *at that moment*. The first S1-04 implementation
+then opened a **new** TCP connection for every later authenticated request (`GET /health`). If the
+verified child died after startup, its loopback port was released, and a different process bound the
+same port, the next request would have been delivered — bearer token included — to that replacement
+listener, with nothing on the client able to tell it apart from the real service. Two mitigations
+were tried and rejected because they leave the window open: (1) checking a liveness flag before
+and/or after sending, and (2) a fresh challenge followed by a separate connection. In both, the
+service can die between the check and the connection that carries the credential.
+
+**Required property:** every credential-bearing request is bound to the *same* connection whose peer
+was cryptographically verified. No liveness flag, health poll, or fresh challenge is relied on to
+establish this; a check followed by an independent dial cannot close the race.
+
+**Options considered:**
+1. *Liveness flag checked around a per-request dial* — rejected (check-then-use window).
+2. *Fresh challenge, then a separate connection* — rejected (same window).
+3. *One retained, explicitly owned HTTP/1.1 connection, no reconnection (chosen).* The TCP
+   connection opened for the D-025 challenge is kept and used for every later request. The peer
+   process of an established TCP connection cannot change: if the child dies the connection is
+   closed or reset, and a listener that binds the freed port is a different socket that this
+   connection can never be redirected to.
+4. *An authenticated transport (e.g. TLS pinned to a per-launch key).* Would also satisfy the
+   property, but adds certificate/key generation and a TLS stack for a loopback-only service.
+   Not chosen as larger than needed; it remains the fallback if the retained-connection approach
+   ever proves insufficient (see limitations).
+
+**Decision:** Option 3, implemented in `app/src-tauri/src/supervisor/pinned_http.rs`:
+- `PinnedConnection` wraps `hyper::client::conn::http1` (`SendRequest` + its `Connection` driver
+  task). That API is constructed from one already-connected I/O object and has no facility to dial;
+  it does not retry or reconnect. The rest of the module never calls `connect` a second time, and
+  `PinnedConnection::connect` is invoked exactly once per launch, inside the `VerifyingIdentity`
+  step, before the challenge is sent.
+- `reqwest` (used by the previous revision) was removed from the supervisor. A `reqwest::Client`
+  dials on demand and may pool or re-establish connections; connection reuse there is an
+  optimization, not a guarantee, so no pool setting could provide this property.
+- Loss of the connection for any reason (child exit, reset, protocol error, server-initiated close)
+  is a terminal event: `Ready` is revoked, `SupervisorHandle::ready_connection()` returns `None`,
+  the child is torn down, the state becomes `Failed("authenticated_connection_lost")` (or
+  `child_exited_unexpectedly` if the process exit is observed first), and in-flight and later health
+  calls fail. The old bearer token is never sent to that port again; there is no reconnect path.
+  The UI clears any previously received health result when state leaves `ready`.
+- The service must not reap the idle connection. `service/.../supervised.py` sets uvicorn
+  `timeout_keep_alive` to 7 days (uvicorn's default of 5 s closed the connection on a healthy child
+  and caused a spurious fail-closed; observed during S1-04 round 2 verification).
+- Requests share the one connection through a mutex (one in flight at a time). The current traffic
+  (a startup challenge and `/health`) does not need more; revisit if high-volume requests are
+  routed through it.
+
+**Limitations (accepted, not hidden):**
+- After 7 days of *complete* idleness the server would close the connection and the app fails closed
+  until the service is restarted. Only a ~7 s idle period is exercised in tests.
+- The guarantee rests on the OS attributing the accepted socket to the spawned child. If that
+  socket handle were inherited by another process, that process could keep the connection open
+  after the child died. Python sockets are non-inheritable by default (PEP 446) and the child is
+  in a kill-on-close Job Object; neither was independently tested for this scenario.
+- Loopback HTTP remains plaintext (unchanged from D-009): a local administrator or a packet-level
+  attacker who can read or inject into an established loopback TCP stream is out of scope for this
+  decision. Option 4 would address that.
+- A request that exceeds its timeout (10 s) makes hyper close the connection (observed in
+  `a_request_that_times_out_*`), which ends the session as a lost connection. This is fail-closed
+  but means one unusually slow `/health` response terminates the session until restart.
+- There is no automatic recovery: restarting the service means a new supervisor, child, startup
+  secret and session token (D-018 step 6).
+- Verified on Windows only.
+
+**Consequences:** `Cargo.toml`: `reqwest` removed from this crate; `hyper` (`client`, `http1`),
+`hyper-util` (`tokio`), `http-body-util` and `bytes` added — all already present in the dependency
+tree via Tauri, no new crates in `Cargo.lock` — and tokio's `net` feature enabled explicitly (it was
+previously enabled only through `reqwest`). `HttpClientBuildFailed` removed from `FailureReason`;
+`AuthenticatedConnectionLost` added. Tests: see `supervisor/pinned_http.rs` and
+`supervisor/mod.rs` (`child_death_*`, `lost_authenticated_connection_*`,
+`pinned_connection_survives_idling_*`).
 
 ---
 
