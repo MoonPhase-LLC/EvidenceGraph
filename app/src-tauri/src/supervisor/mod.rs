@@ -505,12 +505,18 @@ async fn verify_identity(
         return Err(FailureReason::ChallengeResponseRejected);
     }
 
-    let body_bytes = pinned_http::read_bounded_body(response.into_body(), MAX_HTTP_RESPONSE_BYTES)
-        .await
-        .map_err(|e| match e {
-            pinned_http::ReadBodyError::TooLarge => FailureReason::ChallengeResponseTooLarge,
-            pinned_http::ReadBodyError::ReadFailed => FailureReason::ChallengeRequestFailed,
-        })?;
+    let body_bytes = pinned_http::read_bounded_body(
+        response.into_body(),
+        MAX_HTTP_RESPONSE_BYTES,
+        HTTP_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|e| match e {
+        pinned_http::ReadBodyError::TooLarge => FailureReason::ChallengeResponseTooLarge,
+        pinned_http::ReadBodyError::ReadFailed | pinned_http::ReadBodyError::TimedOut => {
+            FailureReason::ChallengeRequestFailed
+        }
+    })?;
 
     let parsed: ChallengeResponseBody = serde_json::from_slice(&body_bytes)
         .map_err(|_| FailureReason::ChallengeResponseMalformed)?;
@@ -666,12 +672,18 @@ async fn check_service_health_inner(
         return Err(HealthCheckError::UnexpectedStatus);
     }
 
-    let body_bytes = pinned_http::read_bounded_body(response.into_body(), MAX_HTTP_RESPONSE_BYTES)
-        .await
-        .map_err(|e| match e {
-            pinned_http::ReadBodyError::TooLarge => HealthCheckError::ResponseTooLarge,
-            pinned_http::ReadBodyError::ReadFailed => HealthCheckError::RequestFailed,
-        })?;
+    let body_bytes = pinned_http::read_bounded_body(
+        response.into_body(),
+        MAX_HTTP_RESPONSE_BYTES,
+        HTTP_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|e| match e {
+        pinned_http::ReadBodyError::TooLarge => HealthCheckError::ResponseTooLarge,
+        pinned_http::ReadBodyError::ReadFailed | pinned_http::ReadBodyError::TimedOut => {
+            HealthCheckError::RequestFailed
+        }
+    })?;
 
     // The connection cannot have silently reconnected to anything else in
     // between -- but it can have gone from alive to dead while this
@@ -1390,7 +1402,12 @@ mod tests {
             .send(close_request, HTTP_REQUEST_TIMEOUT)
             .await
             .expect("live child answers");
-        let _ = pinned_http::read_bounded_body(response.into_body(), MAX_HTTP_RESPONSE_BYTES).await;
+        let _ = pinned_http::read_bounded_body(
+            response.into_body(),
+            MAX_HTTP_RESPONSE_BYTES,
+            HTTP_REQUEST_TIMEOUT,
+        )
+        .await;
 
         wait_for_failed(&child.handle).await;
         assert_eq!(

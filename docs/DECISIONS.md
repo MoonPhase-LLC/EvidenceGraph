@@ -913,6 +913,9 @@ establish this; a check followed by an independent dial cannot close the race.
 - Loopback HTTP remains plaintext (unchanged from D-009): a local administrator or a packet-level
   attacker who can read or inject into an established loopback TCP stream is out of scope for this
   decision. Option 4 would address that.
+- A request that exceeds its timeout (10 s) makes hyper close the connection (observed in
+  `a_request_that_times_out_*`), which ends the session as a lost connection. This is fail-closed
+  but means one unusually slow `/health` response terminates the session until restart.
 - There is no automatic recovery: restarting the service means a new supervisor, child, startup
   secret and session token (D-018 step 6).
 - Verified on Windows only.

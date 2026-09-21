@@ -222,29 +222,38 @@ impl PinnedConnection {
 /// Reads a response body incrementally, enforcing `max_bytes` against
 /// bytes *actually received* -- never `Content-Length`, mirroring the
 /// same bounded-read discipline the prior `reqwest`-based implementation
-/// used (S1-04 review finding 3).
+/// used (S1-04 review finding 3). `read_timeout` bounds the *whole* body
+/// read, so a responder that sends headers and then stalls or trickles
+/// bytes cannot hang the caller -- the old client's overall request timeout
+/// covered the body, and `send`'s timeout only covers up to the headers.
 pub async fn read_bounded_body(
     mut body: Incoming,
     max_bytes: usize,
+    read_timeout: Duration,
 ) -> Result<Vec<u8>, ReadBodyError> {
-    let mut buf = Vec::new();
-    loop {
-        let Some(frame) = body.frame().await else {
-            return Ok(buf);
-        };
-        let frame = frame.map_err(|_| ReadBodyError::ReadFailed)?;
-        if let Some(data) = frame.data_ref() {
-            buf.extend_from_slice(data);
-            if buf.len() > max_bytes {
-                return Err(ReadBodyError::TooLarge);
+    timeout(read_timeout, async {
+        let mut buf = Vec::new();
+        loop {
+            let Some(frame) = body.frame().await else {
+                return Ok(buf);
+            };
+            let frame = frame.map_err(|_| ReadBodyError::ReadFailed)?;
+            if let Some(data) = frame.data_ref() {
+                buf.extend_from_slice(data);
+                if buf.len() > max_bytes {
+                    return Err(ReadBodyError::TooLarge);
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|_| ReadBodyError::TimedOut)?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadBodyError {
     ReadFailed,
+    TimedOut,
     TooLarge,
 }
 
@@ -293,7 +302,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-        let body = read_bounded_body(response.into_body(), 4096).await.unwrap();
+        let body = read_bounded_body(response.into_body(), 4096, Duration::from_secs(3))
+            .await
+            .unwrap();
         assert_eq!(body, b"ok");
     }
 
@@ -406,7 +417,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), 200);
-            let _ = read_bounded_body(response.into_body(), 4096).await.unwrap();
+            let _ = read_bounded_body(response.into_body(), 4096, Duration::from_secs(3))
+                .await
+                .unwrap();
         }
 
         assert_eq!(accept_count.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -589,7 +602,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let _ = read_bounded_body(first.into_body(), 4096).await;
+        let _ = read_bounded_body(first.into_body(), 4096, Duration::from_secs(3)).await;
 
         tokio::time::timeout(Duration::from_secs(2), conn.closed())
             .await
@@ -608,6 +621,141 @@ mod tests {
             )
             .await;
         assert!(second_ignoring_flag.is_err());
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_response_body_is_bounded_by_the_read_timeout() {
+        // Headers arrive, then the body stalls forever. `send`'s timeout
+        // only covers up to the headers, so without a deadline on the body
+        // read a hostile or hung responder could hang the caller.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK
+Content-Length: 100
+
+ab",
+                    )
+                    .await;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let conn = PinnedConnection::connect("127.0.0.1", port, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let response = conn
+            .send(
+                get_request("127.0.0.1", port, "/health"),
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let result =
+            read_bounded_body(response.into_body(), 4096, Duration::from_millis(300)).await;
+        assert_eq!(result, Err(ReadBodyError::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_trickled_response_body_is_bounded_by_the_overall_read_timeout() {
+        // One byte at a time, each well inside any per-read idle window:
+        // the deadline must cover the whole body, not each frame.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK
+Content-Length: 1000
+
+",
+                    )
+                    .await;
+                loop {
+                    if socket.write_all(b"x").await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
+
+        let conn = PinnedConnection::connect("127.0.0.1", port, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let response = conn
+            .send(
+                get_request("127.0.0.1", port, "/health"),
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let result =
+            read_bounded_body(response.into_body(), 4096, Duration::from_millis(400)).await;
+        assert_eq!(result, Err(ReadBodyError::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn a_request_that_times_out_leaves_no_usable_connection_and_never_redials() {
+        // The server accepts and reads the request but never answers. The
+        // send times out. The connection must not remain a usable session
+        // and must never lead to a second dial.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let conn = PinnedConnection::connect("127.0.0.1", port, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let first = conn
+            .send(
+                get_request("127.0.0.1", port, "/health"),
+                Duration::from_millis(300),
+            )
+            .await;
+        assert_eq!(first.err(), Some(PinnedSendError::TimedOut));
+
+        // hyper closes a connection whose in-flight request was cancelled
+        // (observed, not assumed): the session ends rather than lingering
+        // in an indeterminate request/response state.
+        tokio::time::timeout(Duration::from_secs(2), conn.closed())
+            .await
+            .expect("a timed-out request must end the connection");
+        assert!(!conn.is_alive());
+
+        // A later request must fail (not hang, not succeed elsewhere).
+        let second = conn
+            .send(
+                get_request("127.0.0.1", port, "/health"),
+                Duration::from_millis(500),
+            )
+            .await;
+        assert!(second.is_err());
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
