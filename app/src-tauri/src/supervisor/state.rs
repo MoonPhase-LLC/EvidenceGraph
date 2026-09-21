@@ -8,18 +8,20 @@
 //! of this type.
 //!
 //! **S1-04 review finding 1** (revoke stale connections after child
-//! death): [`ReadyConnection`] carries a `watch::Receiver<bool>` --
-//! [`ReadyConnection::is_alive`] -- that the lifecycle task
-//! (`supervisor::run_lifecycle`) flips to `false` the instant it detects
-//! the child has exited or the private channel has failed, *before* doing
-//! anything else. This is a second, faster-reacting signal than
-//! `SupervisorHandle`'s own `state`/`connection` (also updated by the same
-//! event, through the `RwLock`): a `watch` channel read is a single
-//! atomic load, cheaper and more direct than a lock round-trip, which
-//! matters because [`crate::check_service_health`] checks it *twice* --
-//! immediately before sending the authenticated request and again
-//! immediately after receiving the response -- specifically to narrow the
-//! child-death-to-port-reuse race described in that function's own docs.
+//! death -- round 2): [`ReadyConnection`] no longer carries a generic HTTP
+//! client. It carries the one [`super::pinned_http::PinnedConnection`]
+//! that was dialed exactly once, at the moment the child's identity was
+//! cryptographically verified (the D-025 challenge response was read over
+//! this exact TCP connection), plus a `watch::Receiver<bool>` the
+//! lifecycle task (`supervisor::run_lifecycle`) flips to `false` the
+//! instant it detects the child process has exited. [`ReadyConnection::
+//! is_alive`] is the logical AND of both signals: the process being known
+//! alive, and the pinned connection itself still being open. Neither
+//! signal -- nor a request-time check of either -- is what actually
+//! prevents credential disclosure to a replacement listener; that
+//! guarantee comes from `PinnedConnection` structurally never dialing a
+//! second connection to the same address once the first is established
+//! (see that module's docs and `docs/DECISIONS.md` D-026).
 //!
 //! **S1-04 review finding 2** (idempotent shutdown): [`SupervisorHandle::
 //! arm`]/[`SupervisorHandle::take_cancellation_token`] and
@@ -29,6 +31,7 @@
 //! always observes `None` -- there is no way to cancel twice or await the
 //! same lifecycle task twice.
 
+use super::pinned_http::PinnedConnection;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
@@ -53,8 +56,8 @@ pub struct ReadyConnection {
     pub host: String,
     pub port: u16,
     pub token: String,
-    pub http_client: reqwest::Client,
-    alive: watch::Receiver<bool>,
+    pub(super) pinned: PinnedConnection,
+    process_alive: watch::Receiver<bool>,
 }
 
 impl ReadyConnection {
@@ -62,23 +65,28 @@ impl ReadyConnection {
         host: String,
         port: u16,
         token: String,
-        http_client: reqwest::Client,
-        alive: watch::Receiver<bool>,
+        pinned: PinnedConnection,
+        process_alive: watch::Receiver<bool>,
     ) -> Self {
         Self {
             host,
             port,
             token,
-            http_client,
-            alive,
+            pinned,
+            process_alive,
         }
     }
 
-    /// A cheap, direct liveness check -- see module docs for why
-    /// `check_service_health` calls this both before and after its HTTP
-    /// request rather than relying on a single check.
+    /// `true` only while *both* signals say so: the lifecycle task has
+    /// not observed the child process exit, **and** the one pinned TCP
+    /// connection to it is still open. Either going false is permanent
+    /// for this `ReadyConnection` -- nothing here ever re-dials or
+    /// resets either signal back to `true`. See module docs for why
+    /// neither signal alone, nor this combined check alone, is what
+    /// actually prevents credential disclosure to a replacement listener
+    /// (`PinnedConnection`'s own never-redial guarantee is).
     pub fn is_alive(&self) -> bool {
-        *self.alive.borrow()
+        *self.process_alive.borrow() && self.pinned.is_alive()
     }
 }
 
@@ -200,17 +208,32 @@ impl SupervisorHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn ready_connection(port: u16) -> (ReadyConnection, watch::Sender<bool>) {
+    /// Builds a `ReadyConnection` backed by a real (but otherwise unused)
+    /// `PinnedConnection` -- these tests exercise `SupervisorHandle`'s
+    /// state-management logic (`Option` handling, the combined
+    /// `is_alive()` gate), not networking behavior itself, but
+    /// `PinnedConnection::connect` needs a real listening socket to
+    /// succeed. `port` is the value stored in the returned
+    /// `ReadyConnection.port` field for assertions -- independent of the
+    /// listener's actual ephemeral port, since nothing here sends traffic
+    /// over the pinned connection.
+    async fn ready_connection(port: u16) -> (ReadyConnection, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Held open for the listener's own lifetime so the connection
+        // this test constructs doesn't observe an immediate close.
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+            std::future::pending::<()>().await
+        });
+        let pinned = PinnedConnection::connect("127.0.0.1", addr.port(), Duration::from_secs(3))
+            .await
+            .unwrap();
         (
-            ReadyConnection::new(
-                "127.0.0.1".into(),
-                port,
-                "abc".into(),
-                reqwest::Client::new(),
-                rx,
-            ),
+            ReadyConnection::new("127.0.0.1".into(), port, "abc".into(), pinned, rx),
             tx,
         )
     }
@@ -234,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn ready_connection_available_only_after_set_ready() {
         let handle = SupervisorHandle::new();
-        let (connection, _tx) = ready_connection(12345);
+        let (connection, _tx) = ready_connection(12345).await;
         handle.set_ready(connection).await;
 
         assert_eq!(handle.snapshot().await, SupervisorState::Ready);
@@ -245,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn failed_state_never_exposes_a_connection() {
         let handle = SupervisorHandle::new();
-        let (connection, _tx) = ready_connection(1);
+        let (connection, _tx) = ready_connection(1).await;
         handle.set_ready(connection).await;
         handle
             .set_state(SupervisorState::Failed {
@@ -259,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_ready_clears_connection_and_sets_failed_atomically() {
         let handle = SupervisorHandle::new();
-        let (connection, _tx) = ready_connection(1);
+        let (connection, _tx) = ready_connection(1).await;
         handle.set_ready(connection).await;
 
         handle.invalidate_ready("child_exited_unexpectedly").await;
@@ -276,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn mark_stopped_clears_connection() {
         let handle = SupervisorHandle::new();
-        let (connection, _tx) = ready_connection(1);
+        let (connection, _tx) = ready_connection(1).await;
         handle.set_ready(connection).await;
 
         handle.mark_stopped().await;
@@ -287,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_connection_is_alive_reflects_the_watch_channel() {
-        let (connection, tx) = ready_connection(1);
+        let (connection, tx) = ready_connection(1).await;
         assert!(connection.is_alive());
 
         tx.send(false).unwrap();

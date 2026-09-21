@@ -32,8 +32,13 @@ pub enum FailureReason {
     PrivateChannelReadFailed,
     ChildExitedDuringStartup,
     ChildExitedUnexpectedly,
+    /// S1-04 review round 2, finding 1: the one pinned HTTP/1.1 connection
+    /// to the verified child was lost (reset, protocol error, clean
+    /// close) -- distinct from `ChildExitedUnexpectedly` because this can
+    /// fire even if the OS hasn't yet delivered a process-exit
+    /// notification for the child itself. See `pinned_http` module docs.
+    AuthenticatedConnectionLost,
     EndpointNotLoopback,
-    HttpClientBuildFailed,
     ChallengeRequestFailed,
     ChallengeResponseRejected,
     ChallengeResponseMalformed,
@@ -56,8 +61,8 @@ impl FailureReason {
             Self::PrivateChannelReadFailed => "private_channel_read_failed",
             Self::ChildExitedDuringStartup => "child_exited_during_startup",
             Self::ChildExitedUnexpectedly => "child_exited_unexpectedly",
+            Self::AuthenticatedConnectionLost => "authenticated_connection_lost",
             Self::EndpointNotLoopback => "endpoint_not_loopback",
-            Self::HttpClientBuildFailed => "http_client_build_failed",
             Self::ChallengeRequestFailed => "challenge_request_failed",
             Self::ChallengeResponseRejected => "challenge_response_rejected",
             Self::ChallengeResponseMalformed => "challenge_response_malformed",

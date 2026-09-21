@@ -54,6 +54,17 @@ logger = logging.getLogger("evidencegraph_service.supervised")
 
 _STARTUP_ERROR_EXIT_CODE = 1
 
+# The Tauri parent keeps ONE explicitly owned HTTP/1.1 connection to this
+# process for the whole session and never redials it (D-026: a redial to
+# the same port is exactly what would let a replacement listener receive
+# the session credential after this process dies). Uvicorn's default
+# `timeout_keep_alive` of 5s would close that connection whenever it sat
+# idle, which the parent must treat as a lost authenticated connection and
+# fail closed. A long idle allowance is therefore required for correctness,
+# not an optimization. Uvicorn has no per-connection setting, so this
+# applies to every connection to this loopback-only service.
+_KEEP_ALIVE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+
 
 def _fail(reason: str) -> NoReturn:
     """Logs a bounded reason, best-effort notifies the parent over the
@@ -178,7 +189,13 @@ def main() -> None:
             extra={"host": host, "port": port, "environment": settings.environment},
         )
 
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            timeout_keep_alive=_KEEP_ALIVE_TIMEOUT_SECONDS,
+        )
         server = uvicorn.Server(config)
         outcome = _ProtocolOutcome()
 

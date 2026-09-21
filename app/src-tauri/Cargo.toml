@@ -26,15 +26,28 @@ serde_json = "1"
 # challenge round trip needs an async runtime with process/IO/timer
 # support. Tauri's own async runtime is already tokio-based, so this adds
 # the specific feature flags this crate uses directly rather than a new
-# runtime.
-tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "macros"] }
-# The D-025 challenge is an HTTP round trip Rust makes *to* the child --
-# never exposed to the frontend/WebView, so this is plain backend-only
-# usage, not the `tauri-plugin-http` capability surface. Already resolved
-# transitively in this workspace (see `Cargo.lock`); `default-features =
-# false` drops the TLS backend this loopback-only, plaintext-HTTP use has
-# no need for.
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# runtime. `net` (TcpStream, used by `supervisor/pinned_http.rs`) was
+# previously enabled only implicitly by `reqwest` via feature unification;
+# it is declared explicitly now that `reqwest` is no longer a dependency of
+# this crate (D-026).
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "macros", "net"] }
+# S1-04 review round 2, finding 1: the D-025 challenge response and every
+# subsequent authenticated request (the `/health` check) are now sent over
+# one explicitly owned TCP connection, opened exactly once per launch and
+# never redialed -- see `supervisor/pinned_http.rs` module docs and
+# `docs/DECISIONS.md` D-026 for why a pooled/auto-redialing HTTP client
+# (this crate's previous `reqwest`-based design) could not give that
+# guarantee. `hyper`'s low-level client connection API is what makes a
+# single, explicitly-driven, never-reconnecting connection possible;
+# `hyper-util`/`http-body-util`/`bytes` are the minimal companion crates
+# its API requires (Tokio I/O adapter, request/response body types).
+# `default-features = false` on each drops unused TLS/HTTP2/server-side
+# feature surface. All four are already resolved transitively in this
+# workspace via other dependencies.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 # D-025's domain-separated HMAC-SHA-256 challenge construction
 # (`supervisor/challenge.rs`, mirrors `service/src/evidencegraph_service/
 # challenge.py` byte-for-byte). Both already resolved transitively.

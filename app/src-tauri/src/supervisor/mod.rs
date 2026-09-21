@@ -26,11 +26,14 @@
 //! **A single background task owns the entire lifecycle** ([`run_lifecycle`],
 //! spawned once by [`start`]): it runs the startup handshake, and --
 //! critically for S1-04 review finding 1 -- *keeps running* after
-//! publishing `Ready`, continuously watching the child (`child.wait()`)
-//! and reacting to a cancellation request (`shutdown`) via one
-//! `tokio::select!`. This is what makes "revoke stale connections after
-//! child death" true: there is no point between `Ready` and an explicit
-//! `shutdown` where nothing is watching the child. [`SupervisorHandle::
+//! publishing `Ready`, continuously watching both the child
+//! (`child.wait()`) and the one pinned HTTP connection to it
+//! (`pinned.closed()` -- see `pinned_http` module docs and
+//! `docs/DECISIONS.md` D-026), and reacting to a cancellation request
+//! (`shutdown`) via one `tokio::select!`. This is what makes "revoke
+//! stale connections after child death" true: there is no point between
+//! `Ready` and an explicit `shutdown` where nothing is watching the
+//! child or its connection. [`SupervisorHandle::
 //! arm`]/[`take_cancellation_token`](SupervisorHandle::take_cancellation_token)
 //! and the stored `JoinHandle` make [`start`]/[`shutdown`] idempotent
 //! (S1-04 review finding 2): a cancelled startup can never subsequently
@@ -45,6 +48,7 @@ mod challenge;
 pub mod errors;
 #[cfg(windows)]
 mod job_object;
+mod pinned_http;
 mod process;
 mod protocol;
 mod state;
@@ -52,6 +56,10 @@ mod state;
 pub use errors::{FailureReason, HealthCheckError};
 pub use state::{ReadyConnection, SupervisorHandle, SupervisorState};
 
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::Request;
+use pinned_http::PinnedConnection;
 use rand::RngCore;
 use std::path::Path;
 use std::time::Duration;
@@ -231,7 +239,7 @@ async fn watch_ready_process(
         host,
         port,
         token: session_token,
-        http_client,
+        pinned,
     } = handshake;
     let SpawnedProcess {
         mut child,
@@ -247,7 +255,7 @@ async fn watch_ready_process(
             host,
             port,
             session_token,
-            http_client,
+            pinned.clone(),
             alive_rx,
         ))
         .await;
@@ -259,6 +267,17 @@ async fn watch_ready_process(
             // liveness signal before anything else, then reap/invalidate.
             let _ = alive_tx.send(false);
             handle.invalidate_ready(FailureReason::ChildExitedUnexpectedly.as_str()).await;
+        }
+        () = pinned.closed() => {
+            // S1-04 review round 2, finding 1: the pinned connection can
+            // in principle be lost (reset, protocol error, clean close)
+            // without the OS having yet delivered this process's own
+            // `child.wait()` notification -- react to *either* signal,
+            // proactively, rather than only discovering a dead connection
+            // reactively the next time something tries to use it.
+            debug_log("pinned connection to child lost", &"");
+            let _ = alive_tx.send(false);
+            handle.invalidate_ready(FailureReason::AuthenticatedConnectionLost.as_str()).await;
         }
         () = token.cancelled() => {
             let _ = alive_tx.send(false);
@@ -293,7 +312,7 @@ struct HandshakeResult {
     host: String,
     port: u16,
     token: String,
-    http_client: reqwest::Client,
+    pinned: PinnedConnection,
 }
 
 /// The Tauri-independent core of the startup handshake: spawn, private-
@@ -355,8 +374,20 @@ async fn run_startup_with_executable(
     let endpoint = race_read(&mut child, protocol::read_endpoint_ready(&mut stdout)).await?;
 
     handle.set_state(SupervisorState::VerifyingIdentity).await;
-    let http_client = build_http_client()?;
-    verify_identity(&http_client, &secret, &endpoint.host, endpoint.port).await?;
+    // S1-04 review round 2, finding 1: dial the child's endpoint *here* --
+    // exactly once for this handshake -- and verify identity over this
+    // exact connection. `pinned` is then carried all the way through to
+    // `HandshakeResult`/`ReadyConnection` and reused for every later
+    // authenticated request; nothing after this point ever calls
+    // `PinnedConnection::connect` again. See `pinned_http` module docs and
+    // `docs/DECISIONS.md` D-026.
+    let pinned = PinnedConnection::connect(&endpoint.host, endpoint.port, HTTP_CONNECT_TIMEOUT)
+        .await
+        .map_err(|e| {
+            debug_log("pinned connection failed", &e);
+            FailureReason::ChallengeRequestFailed
+        })?;
+    verify_identity(&pinned, &secret, &endpoint.host, endpoint.port).await?;
 
     handle
         .set_state(SupervisorState::InstallingCredential)
@@ -378,7 +409,7 @@ async fn run_startup_with_executable(
         host: endpoint.host,
         port: endpoint.port,
         token,
-        http_client,
+        pinned,
     })
 }
 
@@ -420,75 +451,50 @@ where
     }
 }
 
-fn build_http_client() -> Result<reqwest::Client, FailureReason> {
-    reqwest::Client::builder()
-        .no_proxy()
-        // This client is used at most a handful of times total per app
-        // session (the challenge request, then occasional
-        // `check_service_health` calls) -- no throughput benefit to
-        // pooling, and not reusing connections removes one more variable
-        // if a connection-level issue is ever suspected again.
-        .pool_max_idle_per_host(0)
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
-        // Never follow a redirect: this client only ever talks to a
-        // loopback endpoint it just verified belongs to its own spawned
-        // child, and a redirect response is not something that endpoint
-        // has any legitimate reason to send. Following one could send the
-        // session token (or, during the challenge phase, evidence of the
-        // handshake itself) to an arbitrary `Location`.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| {
-            debug_log("http client build failed", &e);
-            FailureReason::HttpClientBuildFailed
-        })
-}
-
-enum BoundedReadError {
-    ReadFailed,
-    TooLarge,
-}
-
-/// Reads a response body incrementally, enforcing `max_bytes` against the
-/// number of bytes *actually received* -- never against the `Content-
-/// Length` header, which this deliberately never even inspects. A
-/// response that never stops sending data (or that lies about its
-/// length) is caught here, before any JSON parsing is attempted, not
-/// after buffering an unbounded amount of it.
-async fn read_bounded_body(
-    mut response: reqwest::Response,
-    max_bytes: usize,
-) -> Result<Vec<u8>, BoundedReadError> {
-    let mut buf = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > max_bytes {
-                    return Err(BoundedReadError::TooLarge);
-                }
-            }
-            Ok(None) => return Ok(buf),
-            Err(_) => return Err(BoundedReadError::ReadFailed),
-        }
+/// Builds a request against the pinned connection's own endpoint. `host`/
+/// `port` are only used for the mandatory HTTP/1.1 `Host` header --
+/// `hyper`'s low-level client does not add one automatically the way
+/// `reqwest` did.
+fn build_request(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> Request<Full<Bytes>> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("Host", format!("{host}:{port}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("Content-Type", content_type);
     }
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .expect("request built from a fixed, valid set of headers")
 }
 
 async fn verify_identity(
-    client: &reqwest::Client,
+    pinned: &PinnedConnection,
     secret: &[u8],
     host: &str,
     port: u16,
 ) -> Result<(), FailureReason> {
     let canonical = challenge::canonical_endpoint(host, port);
     let nonce = random_bytes(NONCE_LEN);
-    let url = format!("http://{host}:{port}/__startup/challenge");
+    let body = serde_json::to_vec(&serde_json::json!({ "nonce": b64url::encode(&nonce) })).unwrap();
+    let request = build_request(
+        "POST",
+        host,
+        port,
+        "/__startup/challenge",
+        Some("application/json"),
+        body,
+    );
 
-    let response = client
-        .post(&url)
-        .json(&serde_json::json!({ "nonce": b64url::encode(&nonce) }))
-        .send()
+    let response = pinned
+        .send(request, HTTP_REQUEST_TIMEOUT)
         .await
         .map_err(|e| {
             debug_log("challenge request failed", &e);
@@ -499,11 +505,11 @@ async fn verify_identity(
         return Err(FailureReason::ChallengeResponseRejected);
     }
 
-    let body_bytes = read_bounded_body(response, MAX_HTTP_RESPONSE_BYTES)
+    let body_bytes = pinned_http::read_bounded_body(response.into_body(), MAX_HTTP_RESPONSE_BYTES)
         .await
         .map_err(|e| match e {
-            BoundedReadError::TooLarge => FailureReason::ChallengeResponseTooLarge,
-            BoundedReadError::ReadFailed => FailureReason::ChallengeRequestFailed,
+            pinned_http::ReadBodyError::TooLarge => FailureReason::ChallengeResponseTooLarge,
+            pinned_http::ReadBodyError::ReadFailed => FailureReason::ChallengeRequestFailed,
         })?;
 
     let parsed: ChallengeResponseBody = serde_json::from_slice(&body_bytes)
@@ -526,73 +532,151 @@ async fn verify_identity(
 /// function) was chosen over letting the WebView call the service
 /// directly.
 ///
-/// **S1-04 review finding 1** (the child-death-to-port-reuse race): a
-/// child that exits doesn't necessarily free its port *and* have that
-/// port claimed by something else in the same instant, but there is a
-/// window, however small, between "the socket this process was listening
-/// on becomes free" and "this function's request reaches whatever (if
-/// anything) is now listening there." A single liveness check immediately
-/// before sending the request narrows that window but does not close it:
-/// the child can still die *during* the request, and the OS can hand the
-/// freed ephemeral port to an unrelated process before the response comes
-/// back. This function checks [`ReadyConnection::is_alive`] (backed by a
-/// `watch` channel the lifecycle task flips to `false` the instant it
-/// observes the child exit -- see `state.rs` module docs) both
-/// immediately before sending the request and again immediately after
-/// receiving the response, and treats "dead" at *either* point as a
-/// failure: the response body is never returned to the frontend as a
-/// successful result if the child was ever observed dead around the call.
-///
-/// This does not claim to close the race to *zero*. A sufficiently fast,
-/// already-listening impersonator that answers faster than this
-/// process's own liveness signal propagates (one `watch` channel send,
-/// reacting to an OS process-exit wait that itself resolves promptly)
-/// could theoretically still slip a response through the "before" check
-/// and complete before the "after" check observes the death. Closing that
-/// residual window completely would require authenticating the
-/// *transport* itself on every request (e.g. binding each HTTP
-/// connection's identity to a fresh D-025-style challenge, or moving off
-/// TCP-with-a-reusable-ephemeral-port entirely) -- a material change to
-/// the approved bearer-token-over-HTTP authentication architecture
-/// (D-009), out of scope for S1-04. In practice, the realistic exposure
-/// is the gap between an OS process-exit notification and these two
-/// checks (low single-digit milliseconds), not an attacker-controllable
-/// window: nothing can bind the freed port *before* it is actually freed,
-/// and the real child still owns it until the moment this function's own
-/// liveness signal is already in flight.
+/// **S1-04 review finding 1, round 2** (the child-death-to-port-reuse
+/// credential-disclosure race): the original mitigation here checked a
+/// liveness flag immediately before and after dialing a *fresh*
+/// connection per request. The review correctly rejected that as
+/// insufficient -- "checking a liveness flag before or after sending" and
+/// dialing again regardless is still two separate steps with a window
+/// between them, however small, in which a replacement listener could
+/// have claimed the freed port. This function no longer dials anything at
+/// all: `connection.pinned` is the *exact* TCP connection over which the
+/// D-025 challenge response was cryptographically verified during
+/// startup (see `run_startup_with_executable`), kept open and reused for
+/// every request since. There is no code path in this module, or in
+/// [`pinned_http`], that calls `PinnedConnection::connect` a second time
+/// for an already-established connection. If the child dies -- at any
+/// point, including *during* this exact request -- the OS-level write/
+/// read on this already-open, already-authenticated socket fails (or the
+/// connection is independently observed closed by `watch_ready_process`'s
+/// own `pinned.closed()` race, which runs concurrently with this
+/// function and revokes `Ready` on its own): either way, there is no
+/// possible outcome in which this function's request is ever delivered
+/// to, or a response ever accepted from, anything other than the one
+/// process whose identity was verified at connection time. A replacement
+/// listener bound on the freed port receives *nothing* from this
+/// function, structurally, not probabilistically -- this process's
+/// client-side socket handle refers to the old, dead connection and
+/// nothing reopens it. See `pinned_http` module docs and
+/// `docs/DECISIONS.md` D-026 for the full design and why the prior
+/// `reqwest`-based, dial-per-request approach could not give this
+/// guarantee no matter how its liveness checks were tuned.
 pub async fn check_service_health(
     connection: &ReadyConnection,
+) -> Result<HealthResponse, HealthCheckError> {
+    check_service_health_inner(connection, PostLivenessHook::noop()).await
+}
+
+/// Test-only synchronization point between the initial liveness pre-check
+/// and the actual send, used by the `child_death_*` tests below to force
+/// the exact sequence the review specified *deterministically*: the health
+/// operation reports (over a channel, not a sleep) that it has passed its
+/// pre-check, then blocks until the test has killed the child and bound a
+/// replacement listener and explicitly resumes it. A production call takes
+/// the no-op path: the type is zero-sized outside `cfg(test)` and `fire`
+/// returns immediately.
+#[derive(Default)]
+struct PostLivenessHook {
+    #[cfg(test)]
+    pause: Option<TestPause>,
+}
+
+#[cfg(test)]
+struct TestPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+    /// Skip `PinnedConnection`'s own liveness-flag fast path on resume, so
+    /// the request is written using only the connection itself -- proving
+    /// the guarantee does not depend on any flag being fresh.
+    bypass_liveness_flag: bool,
+}
+
+impl PostLivenessHook {
+    fn noop() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn pause(
+        reached: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+        bypass_liveness_flag: bool,
+    ) -> Self {
+        Self {
+            pause: Some(TestPause {
+                reached,
+                resume,
+                bypass_liveness_flag,
+            }),
+        }
+    }
+
+    /// Returns whether the caller should bypass the liveness-flag fast
+    /// path (always `false` outside tests).
+    async fn fire(self) -> bool {
+        #[cfg(test)]
+        if let Some(pause) = self.pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+            return pause.bypass_liveness_flag;
+        }
+        false
+    }
+}
+
+async fn check_service_health_inner(
+    connection: &ReadyConnection,
+    hook: PostLivenessHook,
 ) -> Result<HealthResponse, HealthCheckError> {
     if !connection.is_alive() {
         return Err(HealthCheckError::ServiceNoLongerAlive);
     }
 
-    let url = format!("http://{}:{}/health", connection.host, connection.port);
-    let response = connection
-        .http_client
-        .get(&url)
-        .bearer_auth(&connection.token)
-        .send()
-        .await
-        .map_err(|e| {
-            debug_log("health request failed", &e);
-            HealthCheckError::RequestFailed
-        })?;
+    let bypass_liveness_flag = hook.fire().await;
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("Host", format!("{}:{}", connection.host, connection.port))
+        .header("Authorization", format!("Bearer {}", connection.token))
+        .body(Full::new(Bytes::new()))
+        .expect("request built from a fixed, valid set of headers");
+
+    #[cfg(test)]
+    let sent = if bypass_liveness_flag {
+        connection
+            .pinned
+            .send_ignoring_liveness_flag(request, HTTP_REQUEST_TIMEOUT)
+            .await
+    } else {
+        connection.pinned.send(request, HTTP_REQUEST_TIMEOUT).await
+    };
+    #[cfg(not(test))]
+    let sent = {
+        let _ = bypass_liveness_flag;
+        connection.pinned.send(request, HTTP_REQUEST_TIMEOUT).await
+    };
+
+    let response = sent.map_err(|e| {
+        debug_log("health request failed", &e);
+        HealthCheckError::RequestFailed
+    })?;
 
     if !response.status().is_success() {
         return Err(HealthCheckError::UnexpectedStatus);
     }
 
-    let body_bytes = read_bounded_body(response, MAX_HTTP_RESPONSE_BYTES)
+    let body_bytes = pinned_http::read_bounded_body(response.into_body(), MAX_HTTP_RESPONSE_BYTES)
         .await
         .map_err(|e| match e {
-            BoundedReadError::TooLarge => HealthCheckError::ResponseTooLarge,
-            BoundedReadError::ReadFailed => HealthCheckError::RequestFailed,
+            pinned_http::ReadBodyError::TooLarge => HealthCheckError::ResponseTooLarge,
+            pinned_http::ReadBodyError::ReadFailed => HealthCheckError::RequestFailed,
         })?;
 
-    // The "after" check: even if the body above parses as a perfectly
-    // valid, successful-looking response, it must not be trusted if the
-    // child was observed to have died while we were reading it.
+    // The connection cannot have silently reconnected to anything else in
+    // between -- but it can have gone from alive to dead while this
+    // request was in flight, which is still worth surfacing distinctly
+    // rather than returning a response that happened to parse.
     if !connection.is_alive() {
         return Err(HealthCheckError::ServiceNoLongerAlive);
     }
@@ -638,13 +722,21 @@ mod tests {
     //!   session token (that step is unreachable without `verify_identity`
     //!   returning `Ok`, enforced by the `?` in `run_startup_with_executable`
     //!   above, not merely by test convention).
-    //! - `child_death_...` tests (S1-04 review finding 1) reproduce the
-    //!   exact reported attack: complete a real handshake, kill the child
-    //!   from *outside* Rust's ownership of it (`taskkill`, simulating a
-    //!   crash or external termination, not a graceful shutdown this
-    //!   process initiated), bind a replacement listener on the freed
-    //!   port, and prove `check_service_health` never sends it a bearer
-    //!   credential and never returns its response as a success.
+    //! - `child_death_...` tests (S1-04 review finding 1, round 2) reproduce
+    //!   the exact reported attack: complete a real handshake, kill the
+    //!   child from *outside* Rust's ownership of it (`taskkill`,
+    //!   simulating a crash or external termination, not a graceful
+    //!   shutdown this process initiated), bind a replacement listener on
+    //!   the freed port, and prove `check_service_health` never sends it a
+    //!   bearer credential and never returns its response as a success.
+    //!   `child_death_between_liveness_check_and_send_never_leaks_
+    //!   credential_to_replacement_listener` additionally forces the exact
+    //!   sequence the review specified -- kill happening *between* the
+    //!   liveness pre-check and the actual send -- deterministically, via
+    //!   `PostLivenessHook`'s `oneshot`-channel synchronization point,
+    //!   rather than relying on sleeps/timing to land the race a
+    //!   particular way. See `pinned_http`'s own test module for the
+    //!   lower-level proof that `PinnedConnection` itself never redials.
     //! - `shutdown_...`/`start_...` tests (S1-04 review finding 2) prove
     //!   idempotency and that a cancelled startup can never publish Ready.
 
@@ -704,13 +796,29 @@ mod tests {
         assert_eq!(health.status, "ok");
         assert_eq!(health.service, "evidencegraph-service");
 
+        // A second call reuses the *same* pinned connection (no new
+        // `TcpStream::connect` happens anywhere in this path) and still
+        // succeeds -- proving ordinary repeated polling works under the
+        // never-redial design, not just a single request.
+        let health_again = check_service_health(&connection)
+            .await
+            .expect("second health check over the reused connection should succeed");
+        assert_eq!(health_again.status, "ok");
+
         // A request with no token must still be rejected -- the token
         // this test holds is not somehow also accepted unauthenticated.
-        let unauthed_url = format!("http://{}:{}/health", connection.host, connection.port);
+        // Sent over the same pinned connection deliberately, to also
+        // prove the server-side auth check is per-request, not something
+        // the persistent connection itself bypasses.
+        let unauthed_request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("Host", format!("{}:{}", connection.host, connection.port))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
         let unauthed = connection
-            .http_client
-            .get(&unauthed_url)
-            .send()
+            .pinned
+            .send(unauthed_request, HTTP_REQUEST_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(unauthed.status(), 401);
@@ -729,6 +837,48 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_connection_survives_idling_past_uvicorns_default_keep_alive() {
+        // uvicorn's `timeout_keep_alive` defaults to 5s: an idle HTTP/1.1
+        // connection is closed by the *server*. The pinned connection is
+        // meant to live for the whole session with no reconnect path, so a
+        // healthy child that closes an idle connection would otherwise
+        // spuriously revoke `Ready`. Idle well past 5s, then require both
+        // that `Ready` is still held and that health succeeds.
+        let (executable, args) = real_dev_target();
+        let handle = SupervisorHandle::new();
+        let handshake = run_startup_with_executable(&handle, &executable, &args)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let watcher = tokio::spawn(watch_ready_process(
+            handle.clone(),
+            handshake,
+            token.clone(),
+        ));
+        assert!(
+            poll_state(
+                &handle,
+                |s| *s == SupervisorState::Ready,
+                Duration::from_secs(5)
+            )
+            .await
+        );
+        let connection = handle.ready_connection().await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(7)).await;
+
+        assert_eq!(handle.snapshot().await, SupervisorState::Ready);
+        assert!(connection.is_alive());
+        let health = check_service_health(&connection)
+            .await
+            .expect("health must succeed on the retained connection after idling");
+        assert_eq!(health.status, "ok");
+
+        token.cancel();
+        watcher.await.unwrap();
     }
 
     #[tokio::test]
@@ -754,9 +904,11 @@ mod tests {
         // Verify with the *wrong* secret -- behaviorally identical, from
         // the verifier's point of view, to the responder being an
         // impersonator that never had the real one.
-        let client = build_http_client().unwrap();
+        let pinned = PinnedConnection::connect(&endpoint.host, endpoint.port, HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
         let wrong_secret = random_bytes(STARTUP_SECRET_LEN);
-        let result = verify_identity(&client, &wrong_secret, &endpoint.host, endpoint.port).await;
+        let result = verify_identity(&pinned, &wrong_secret, &endpoint.host, endpoint.port).await;
         assert!(result.is_err());
 
         // Never send the session token to a child that failed identity
@@ -797,8 +949,10 @@ mod tests {
         let addr =
             fake_http_endpoint("200 OK", format!("{{\"response\":\"{wrong_response}\"}}")).await;
 
-        let client = build_http_client().unwrap();
-        let result = verify_identity(&client, &secret, "127.0.0.1", addr.port()).await;
+        let pinned = PinnedConnection::connect("127.0.0.1", addr.port(), HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        let result = verify_identity(&pinned, &secret, "127.0.0.1", addr.port()).await;
 
         assert!(result.is_err());
     }
@@ -808,8 +962,10 @@ mod tests {
         let secret = b"a-real-secret-the-fake-endpoint-never-saw".to_vec();
         let addr = fake_http_endpoint("200 OK", "not json at all".to_string()).await;
 
-        let client = build_http_client().unwrap();
-        let result = verify_identity(&client, &secret, "127.0.0.1", addr.port()).await;
+        let pinned = PinnedConnection::connect("127.0.0.1", addr.port(), HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        let result = verify_identity(&pinned, &secret, "127.0.0.1", addr.port()).await;
 
         assert!(result.is_err());
     }
@@ -820,8 +976,10 @@ mod tests {
         let addr =
             fake_http_endpoint("404 Not Found", "{\"detail\":\"Not Found\"}".to_string()).await;
 
-        let client = build_http_client().unwrap();
-        let result = verify_identity(&client, &secret, "127.0.0.1", addr.port()).await;
+        let pinned = PinnedConnection::connect("127.0.0.1", addr.port(), HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        let result = verify_identity(&pinned, &secret, "127.0.0.1", addr.port()).await;
 
         assert!(result.is_err());
     }
@@ -836,8 +994,10 @@ mod tests {
         )
         .await;
 
-        let client = build_http_client().unwrap();
-        let result = verify_identity(&client, &secret, "127.0.0.1", addr.port()).await;
+        let pinned = PinnedConnection::connect("127.0.0.1", addr.port(), HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        let result = verify_identity(&pinned, &secret, "127.0.0.1", addr.port()).await;
 
         assert!(result.is_err());
     }
@@ -848,8 +1008,10 @@ mod tests {
         let huge = "x".repeat(MAX_HTTP_RESPONSE_BYTES + 1);
         let addr = fake_http_endpoint("200 OK", format!("{{\"response\":\"{huge}\"}}")).await;
 
-        let client = build_http_client().unwrap();
-        let result = verify_identity(&client, &secret, "127.0.0.1", addr.port()).await;
+        let pinned = PinnedConnection::connect("127.0.0.1", addr.port(), HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        let result = verify_identity(&pinned, &secret, "127.0.0.1", addr.port()).await;
 
         assert!(result.is_err());
     }
@@ -970,15 +1132,96 @@ mod tests {
 
         watcher.await.expect("watcher task should not panic");
     }
+    /// Stands in for an attacker (or any unrelated process) that has
+    /// claimed the port the legitimate child released. Records every
+    /// connection and every raw byte it receives, and answers any request
+    /// with a plausible successful health body -- so if the client ever
+    /// did talk to it, the failure mode under test (a "successful" health
+    /// result from an impostor) would be reachable, making a passing
+    /// assertion meaningful.
+    struct ReplacementListener {
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
 
-    #[tokio::test]
-    async fn child_death_and_port_reuse_never_leaks_credential_to_replacement_listener() {
-        // The exact reported attack: complete a real supervised startup,
-        // terminate the service, bind a replacement listener on its
-        // released port, invoke the health command again, and assert the
-        // replacement listener receives no bearer credential and its
-        // response never reaches the caller as a successful health
-        // result.
+    impl ReplacementListener {
+        /// Binds `port`, retrying until the OS has released it.
+        async fn bind(port: u16) -> Self {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let listener = loop {
+                match TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => break listener,
+                    Err(e) => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "port {port} was never released: {e}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            };
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (a, r) = (accepted.clone(), received.clone());
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let r = r.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        if let Ok(n) = socket.read(&mut buf).await {
+                            r.lock().unwrap().extend_from_slice(&buf[..n]);
+                        }
+                        let body = "{\"status\":\"ok\",\"service\":\"evidencegraph-service\",\"version\":\"0.1.0\"}";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            Self { accepted, received }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn received_contains(&self, needle: &str) -> bool {
+            let bytes = self.received.lock().unwrap();
+            String::from_utf8_lossy(&bytes).contains(needle)
+        }
+
+        fn received_len(&self) -> usize {
+            self.received.lock().unwrap().len()
+        }
+
+        /// The core assertion of every test that uses this type.
+        fn assert_untouched(&self, session_token: &str) {
+            assert_eq!(self.accepted(), 0, "replacement listener saw a connection");
+            assert_eq!(
+                self.received_len(),
+                0,
+                "replacement listener received bytes"
+            );
+            assert!(
+                !self.received_contains(session_token),
+                "replacement listener received the session token"
+            );
+        }
+    }
+
+    struct EstablishedChild {
+        handle: SupervisorHandle,
+        connection: ReadyConnection,
+        pid: u32,
+        watcher: tokio::task::JoinHandle<()>,
+    }
+
+    /// Step 1 of the review's sequence: a real supervised child, fully
+    /// verified, in `Ready`, with the watcher task running.
+    async fn establish_ready_child() -> EstablishedChild {
         let (executable, args) = real_dev_target();
         let handle = SupervisorHandle::new();
         let handshake = run_startup_with_executable(&handle, &executable, &args)
@@ -989,10 +1232,11 @@ mod tests {
             .child
             .id()
             .expect("child should have a pid");
-
-        let token = CancellationToken::new();
-        let watcher = tokio::spawn(watch_ready_process(handle.clone(), handshake, token));
-
+        let watcher = tokio::spawn(watch_ready_process(
+            handle.clone(),
+            handshake,
+            CancellationToken::new(),
+        ));
         assert!(
             poll_state(
                 &handle,
@@ -1002,78 +1246,171 @@ mod tests {
             .await
         );
         let connection = handle.ready_connection().await.unwrap();
-        let port = connection.port;
+        assert!(connection.is_alive());
+        EstablishedChild {
+            handle,
+            connection,
+            pid,
+            watcher,
+        }
+    }
 
-        kill_process_externally(pid);
+    /// Everything that must be true once the authenticated connection is
+    /// gone: Ready revoked, no connection exposed, stale handle dead.
+    async fn assert_access_revoked(child: &EstablishedChild) {
+        match child.handle.snapshot().await {
+            SupervisorState::Failed { reason } => assert!(
+                reason == FailureReason::ChildExitedUnexpectedly.as_str()
+                    || reason == FailureReason::AuthenticatedConnectionLost.as_str(),
+                "unexpected failure reason: {reason}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(child.handle.ready_connection().await.is_none());
+        assert!(!child.connection.is_alive());
+    }
+
+    async fn wait_for_failed(handle: &SupervisorHandle) {
         assert!(
             poll_state(
-                &handle,
+                handle,
                 |s| matches!(s, SupervisorState::Failed { .. }),
                 Duration::from_secs(5)
             )
             .await
         );
+    }
 
-        // Wait for the OS to actually release the port before binding the
-        // replacement -- on Windows this is normally immediate once the
-        // owning process has exited.
-        assert!(
-            wait_until(
-                || std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-                Duration::from_secs(5)
+    #[tokio::test]
+    async fn child_death_and_port_reuse_never_leaks_credential_to_replacement_listener() {
+        // The originally reported attack: verified child dies, a
+        // replacement takes its port, the health command is invoked again.
+        let child = establish_ready_child().await;
+        let port = child.connection.port;
+
+        kill_process_externally(child.pid);
+        wait_for_failed(&child.handle).await;
+        let replacement = ReplacementListener::bind(port).await;
+
+        // Both the stale handle a caller already holds and a fresh lookup
+        // must fail closed.
+        let result = check_service_health(&child.connection).await;
+        assert_eq!(result.unwrap_err(), HealthCheckError::ServiceNoLongerAlive);
+        assert!(child.handle.ready_connection().await.is_none());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        replacement.assert_untouched(&child.connection.token);
+        assert_access_revoked(&child).await;
+        child.watcher.await.expect("watcher task should not panic");
+    }
+
+    /// The review's required sequence, forced deterministically (channels,
+    /// not sleeps):
+    ///
+    /// 1. legitimate service verified and Ready;
+    /// 2. a health operation passes its initial state/liveness check
+    ///    (signalled by `reached`, not assumed);
+    /// 3. the service dies before credential transmission;
+    /// 4. a replacement listener takes the released port;
+    /// 5. the health operation resumes.
+    ///
+    /// `bypass_liveness_flag` additionally skips the connection's own flag
+    /// fast path on resume, so the request is attempted using nothing but
+    /// the connection -- the guarantee must not depend on any flag.
+    async fn death_between_check_and_send(bypass_liveness_flag: bool) {
+        let child = establish_ready_child().await; // step 1
+        let port = child.connection.port;
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let connection_for_health = child.connection.clone();
+        let health_task = tokio::spawn(async move {
+            check_service_health_inner(
+                &connection_for_health,
+                PostLivenessHook::pause(reached_tx, resume_rx, bypass_liveness_flag),
             )
             .await
-        );
-
-        let received_auth_header: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(None));
-        let received_auth_header_clone = received_auth_header.clone();
-        let replacement = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .expect("port should be free");
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = replacement.accept().await {
-                let mut buf = vec![0u8; 4096];
-                if let Ok(n) = socket.read(&mut buf).await {
-                    let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let auth_line = request_text
-                        .lines()
-                        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-                        .map(str::to_string);
-                    *received_auth_header_clone.lock().await = auth_line;
-                }
-                let body = b"{\"status\":\"ok\",\"service\":\"evidencegraph-service\",\"version\":\"0.1.0\"}";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    String::from_utf8_lossy(body)
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            }
         });
+        // Step 2: block until the health operation has *actually* passed
+        // its liveness check and is parked before sending.
+        reached_rx
+            .await
+            .expect("health operation must reach the post-check point");
 
-        // Give the replacement listener a moment to be ready to accept,
-        // then attempt the health check against the stale connection --
-        // this must fail closed via the `is_alive()` check, never
-        // completing a request against the replacement at all.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let result = check_service_health(&connection).await;
+        kill_process_externally(child.pid); // step 3
+        wait_for_failed(&child.handle).await;
+        let replacement = ReplacementListener::bind(port).await; // step 4
+
+        let _ = resume_tx.send(()); // step 5
+        let result = health_task.await.expect("health task should not panic");
 
         assert!(
             result.is_err(),
-            "a stale connection must never report success"
+            "a health operation resumed after the service died must not succeed (got {result:?})"
         );
-        assert_eq!(result.unwrap_err(), HealthCheckError::ServiceNoLongerAlive);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        replacement.assert_untouched(&child.connection.token);
+        assert_access_revoked(&child).await;
+        child.watcher.await.expect("watcher task should not panic");
+    }
 
-        // Give the replacement listener time to have received a
-        // connection, if it were going to.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            received_auth_header.lock().await.is_none(),
-            "the replacement listener must never receive an Authorization header"
+    #[tokio::test]
+    async fn child_death_between_liveness_check_and_send_never_leaks_credential_to_replacement_listener(
+    ) {
+        death_between_check_and_send(false).await;
+    }
+
+    #[tokio::test]
+    async fn child_death_between_liveness_check_and_send_leaks_nothing_even_with_the_liveness_flag_bypassed(
+    ) {
+        death_between_check_and_send(true).await;
+    }
+
+    #[tokio::test]
+    async fn lost_authenticated_connection_with_a_live_child_revokes_ready_and_never_redials() {
+        // Loss of the authenticated connection must revoke access on its
+        // own, independent of the child process exiting. Provoke a real
+        // loss without killing anything: ask the (live) child to end the
+        // keep-alive connection with `Connection: close`.
+        let child = establish_ready_child().await;
+        let port = child.connection.port;
+
+        // No credential is attached: this request exists only to make the
+        // server end the connection.
+        let close_request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("Host", format!("127.0.0.1:{port}"))
+            .header("Connection", "close")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = child
+            .connection
+            .pinned
+            .send(close_request, HTTP_REQUEST_TIMEOUT)
+            .await
+            .expect("live child answers");
+        let _ = pinned_http::read_bounded_body(response.into_body(), MAX_HTTP_RESPONSE_BYTES).await;
+
+        wait_for_failed(&child.handle).await;
+        assert_eq!(
+            child.handle.snapshot().await,
+            SupervisorState::Failed {
+                reason: FailureReason::AuthenticatedConnectionLost.as_str()
+            },
+            "a lost connection must be reported as such, not as child exit"
         );
 
-        watcher.await.expect("watcher task should not panic");
+        // Ready is revoked and health fails closed. The lifecycle task
+        // then drops the child (kill_on_drop), releasing the port; a
+        // replacement claiming it must never be contacted.
+        let replacement = ReplacementListener::bind(port).await;
+        let result = check_service_health(&child.connection).await;
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        replacement.assert_untouched(&child.connection.token);
+        assert_access_revoked(&child).await;
+        child.watcher.await.expect("watcher task should not panic");
     }
 
     fn kill_process_externally(pid: u32) {
@@ -1102,22 +1439,6 @@ mod tests {
         loop {
             let state = handle.snapshot().await;
             if predicate(&state) {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// General-purpose poll for a plain synchronous condition (e.g. "can
-    /// I bind this port yet") where `poll_state` (which is specifically
-    /// about `SupervisorHandle`'s async state) doesn't apply.
-    async fn wait_until<F: Fn() -> bool>(condition: F, timeout_duration: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout_duration;
-        loop {
-            if condition() {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {

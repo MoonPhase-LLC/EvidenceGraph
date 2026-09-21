@@ -53,7 +53,11 @@ function App() {
           const current = await invoke<SupervisorState>("get_service_status");
           if (cancelled) return;
           setStatus(current);
-          if (current.state === "ready" || current.state === "failed" || current.state === "stopped") {
+          // Keep observing after `ready`: the authenticated connection can
+          // be lost later (D-026), which moves the supervisor to `failed`,
+          // and this poll is the only thing that shows the UI that. Only
+          // the terminal states end the poll.
+          if (current.state === "failed" || current.state === "stopped") {
             return;
           }
         } catch {
@@ -75,7 +79,14 @@ function App() {
     // `ready` -- there is nothing to call before then, and
     // `check_service_health` itself also independently refuses
     // (`Err("service_not_ready")`) if called too early.
-    if (status.state !== "ready") return;
+    if (status.state !== "ready") {
+      // Leaving `ready` (connection lost, shutdown) revokes service access,
+      // so a previously received health result is stale and must not keep
+      // being displayed as if the service were still good.
+      setHealth(null);
+      setHealthError(null);
+      return;
+    }
 
     let cancelled = false;
     invoke<HealthResponse>("check_service_health")
