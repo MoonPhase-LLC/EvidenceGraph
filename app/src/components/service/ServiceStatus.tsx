@@ -71,7 +71,9 @@ export function ServiceStatusPanel({ service }: { service: LocalService }) {
           <CardAction>
             {/* `aria-disabled` rather than `disabled` while a check is
                 pending: disabling the focused button would drop keyboard
-                focus to the document body. */}
+                focus to the document body. Pending is shown by the
+                spinning icon, not by fading the button: opacity would also
+                fade the focus outline. */}
             <Button
               variant="outline"
               size="sm"
@@ -80,7 +82,7 @@ export function ServiceStatusPanel({ service }: { service: LocalService }) {
               }}
               aria-disabled={healthPending || undefined}
               aria-label="Check local service health again"
-              className="aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+              className="aria-disabled:cursor-progress"
             >
               <RefreshCw
                 aria-hidden="true"
@@ -92,6 +94,17 @@ export function ServiceStatusPanel({ service }: { service: LocalService }) {
           </CardAction>
         )}
       </CardHeader>
+
+      {/* Health-check outcomes are announced here, not by the status region
+          above: a check can fail while the supervisor stays `ready`, which
+          leaves that region unchanged. This element is always mounted, so
+          it exists before any feedback is written into it. It is empty
+          while a check is pending and filled when the check settles, so
+          repeating a check with the same outcome still changes its content
+          and is announced again. */}
+      <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {healthAnnouncement(ready, health, healthError, healthPending)}
+      </p>
 
       {(ready || text.technicalReason) && (
         <CardContent>
@@ -105,6 +118,23 @@ export function ServiceStatusPanel({ service }: { service: LocalService }) {
       )}
     </Card>
   );
+}
+
+/**
+ * Text for the health live region. Empty unless a check has settled while
+ * the service is `ready`; leaving `ready` empties it silently (the status
+ * region announces that change).
+ */
+function healthAnnouncement(
+  ready: boolean,
+  health: LocalService["health"],
+  error: string | null,
+  pending: boolean,
+): string {
+  if (!ready || pending) return "";
+  if (error) return "Health check failed.";
+  if (health) return `Health check passed: ${health.service} ${health.version} reported ${health.status}.`;
+  return "";
 }
 
 function HealthResult({

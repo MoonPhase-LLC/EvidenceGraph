@@ -65,10 +65,23 @@ Rules that apply to every screen:
   "Technical detail".
 - **Accessibility basics.** Use semantic landmarks (`nav`, `main`) and
   headings, give every icon-only or ambiguous control an `aria-label`,
-  mark decorative icons `aria-hidden`, and keep the default visible focus
-  ring. Use `aria-disabled` rather than `disabled` on a control that can
-  hold focus while it is temporarily inactive (see the health
-  "Check again" button), so keyboard focus is not lost.
+  and mark decorative icons `aria-hidden`. Use `aria-disabled` rather
+  than `disabled` on a control that can hold focus while it is
+  temporarily inactive (see the health "Check again" button), so keyboard
+  focus is not lost. Don't fade such a control with opacity, because that
+  fades its focus outline too.
+- **One focus indicator.** Every keyboard-focusable control uses the same
+  treatment: a 2px solid outline in the theme's `--foreground` color,
+  offset 2px (`focus-visible:outline-2 focus-visible:outline-offset-2
+  focus-visible:outline-solid focus-visible:outline-foreground`). It is
+  built into `Button` and applied to the skip link. This measured above
+  18:1 against the white and sidebar backgrounds. Apply it to any new
+  focusable element that isn't a `Button`.
+- **Announce asynchronous results.** Use a `role="status"` live region
+  that is always mounted, so it exists before its content changes. Clear
+  it when a new operation starts and fill it when the operation settles,
+  so a repeated identical result is announced again. See the health
+  region in `ServiceStatus.tsx`.
 - Import with the `@/` alias (`@/components/...`, `@/service/...`). Note
   that the repository's root `.gitignore` ignores any `lib/` directory, so
   do not put tracked code in `src/lib/`. The shadcn `cn` helper comes from
