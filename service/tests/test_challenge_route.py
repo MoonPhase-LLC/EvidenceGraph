@@ -174,6 +174,24 @@ def test_duplicate_nonce_key_rejected() -> None:
     assert state._attempts == 1
 
 
+def test_noncanonical_nonce_rejected_and_counted() -> None:
+    """S1-04 review round 3, finding 4: a nonce with nonzero unused
+    encoding bits is malformed over HTTP too -- 400, one attempt consumed,
+    no success, route still open for the canonical value."""
+    client, state, _ = _supervised_client()
+
+    response = client.post(CHALLENGE_PATH, json={"nonce": "A" * 21 + "B"})
+
+    assert response.status_code == 400
+    assert state._attempts == 1
+    assert state.succeeded is False
+    assert state.is_open is True
+
+    canonical = client.post(CHALLENGE_PATH, json={"nonce": "A" * 22})
+    assert canonical.status_code == 200
+    assert state._attempts == 2
+
+
 def test_unknown_extra_key_rejected() -> None:
     client, _, _ = _supervised_client()
 

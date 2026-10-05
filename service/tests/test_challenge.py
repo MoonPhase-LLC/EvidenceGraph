@@ -110,6 +110,41 @@ def test_malformed_nonce_is_rejected_and_still_consumes_an_attempt() -> None:
     assert state._attempts == 1
 
 
+def test_noncanonical_nonce_is_rejected_and_still_consumes_an_attempt() -> None:
+    """S1-04 review round 3, finding 4: `"A" * 21 + "B"` sets a nonzero
+    unused bit in a 16-byte nonce's encoding. It must be rejected as
+    malformed -- not silently decoded to the same bytes as `"A" * 22` --
+    and, like any other malformed nonce, still cost one attempt."""
+    state = challenge.StartupChallengeState(secret=SECRET, host=HOST, port=PORT)
+
+    with pytest.raises(challenge.ChallengeError) as exc_info:
+        state.handle_request(nonce_b64="A" * 21 + "B")
+
+    assert str(exc_info.value) == "nonce_invalid_encoding"
+    assert state.is_open is True
+    assert state.succeeded is False
+    assert state._attempts == 1
+
+    # The canonical equivalent is still accepted afterwards, drawing from
+    # the same budget.
+    state.handle_request(nonce_b64="A" * 22)
+    assert state.succeeded is True
+    assert state._attempts == 2
+
+
+def test_noncanonical_nonces_alone_can_exhaust_the_budget() -> None:
+    state = challenge.StartupChallengeState(secret=SECRET, host=HOST, port=PORT)
+
+    for _ in range(challenge.MAX_ATTEMPTS):
+        with pytest.raises(challenge.ChallengeError):
+            state.handle_request(nonce_b64="A" * 21 + "B")
+
+    assert state.is_open is False
+    assert state.succeeded is False
+    with pytest.raises(challenge.ChallengeError):
+        state.handle_request(nonce_b64="A" * 22)
+
+
 @pytest.mark.parametrize("length", [0, 1, 15, 17, 32, 64])
 def test_handle_request_rejects_wrong_length_nonce(length: int) -> None:
     """Exact-length wire schema enforcement (S1-04 review finding 5): a

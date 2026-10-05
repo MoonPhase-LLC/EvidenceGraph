@@ -34,14 +34,23 @@
 //! stale connections after child death" true: there is no point between
 //! `Ready` and an explicit `shutdown` where nothing is watching the
 //! child or its connection. [`SupervisorHandle::
-//! arm`]/[`take_cancellation_token`](SupervisorHandle::take_cancellation_token)
-//! and the stored `JoinHandle` make [`start`]/[`shutdown`] idempotent
-//! (S1-04 review finding 2): a cancelled startup can never subsequently
-//! publish `Ready` (the code path that does so is structurally
-//! unreachable once the cancellation branch of a `select!` wins -- the
-//! losing branch's future, and everything it owned, is simply dropped),
-//! and a second `shutdown` call is a no-op because the cancellation token
-//! and the task handle can each only be taken once.
+//! arm_and_spawn`]/[`begin_shutdown`](SupervisorHandle::begin_shutdown)
+//! make [`start`]/[`shutdown`] idempotent (S1-04 review finding 2): the
+//! cancellation token and the task handle are registered together and
+//! can each only be taken once, so a second `shutdown` call is a no-op.
+//!
+//! **Shutdown vs. readiness** (S1-04 review round 3, finding 1): the
+//! `select!` in [`run_lifecycle`] only covers shutdown arriving *during*
+//! the handshake. Shutdown can also arrive after the handshake has won
+//! that race but before `Ready` is published. Readiness publication and
+//! shutdown recording are therefore decided under the same
+//! [`SupervisorHandle`] lock: [`begin_shutdown`](SupervisorHandle::
+//! begin_shutdown) records the request and revokes any published
+//! connection in one step, and [`set_ready`](SupervisorHandle::set_ready)
+//! refuses to publish once that record exists. Whichever takes the lock
+//! first wins; there is no separate check-then-publish step for the
+//! other to slip between. If shutdown wins, the lifecycle stops the child
+//! without ever exposing a connection.
 
 mod b64url;
 mod challenge;
@@ -138,31 +147,35 @@ struct ChallengeResponseBody {
 
 /// Starts the supervisor's single lifecycle task. Idempotent: a second
 /// call on the same (already-armed) `handle` is a no-op -- see
-/// [`SupervisorHandle::arm`].
+/// [`SupervisorHandle::arm_and_spawn`].
 pub async fn start(app: AppHandle, handle: SupervisorHandle) {
     let token = CancellationToken::new();
-    if !handle.arm(token.clone()).await {
-        return;
-    }
     let handle_for_task = handle.clone();
-    let join = tauri::async_runtime::spawn(run_lifecycle(app, handle_for_task, token));
-    handle.set_lifecycle_task(join).await;
+    let token_for_task = token.clone();
+    // Registering the token and the task handle in one locked step means
+    // a concurrent `shutdown` either sees neither (and this then refuses
+    // to start, because shutdown was recorded first) or both (and waits
+    // for the task) -- never a cancelled token with no task to await.
+    handle
+        .arm_and_spawn(token, move || {
+            tauri::async_runtime::spawn(run_lifecycle(app, handle_for_task, token_for_task))
+        })
+        .await;
 }
 
 /// Requests shutdown and waits for the lifecycle task to finish cleaning
 /// up. Idempotent (S1-04 review finding 2): calling this more than once,
 /// concurrently or sequentially, cancels/awaits at most once --
-/// `take_cancellation_token`/`take_lifecycle_task` each hand out their
-/// value to exactly one caller. A no-op if the supervisor never started
-/// or has already fully shut down.
+/// [`SupervisorHandle::begin_shutdown`] hands the token and task to
+/// exactly one caller. Always records the request first, so even a call
+/// before the supervisor started (or racing readiness publication)
+/// prevents any later `Ready` -- see module docs.
 pub async fn shutdown(handle: &SupervisorHandle) {
-    let Some(token) = handle.take_cancellation_token().await else {
+    let Some((token, join)) = handle.begin_shutdown().await else {
         return;
     };
     token.cancel();
-    if let Some(join) = handle.take_lifecycle_task().await {
-        let _ = timeout(LIFECYCLE_JOIN_TIMEOUT, join).await;
-    }
+    let _ = timeout(LIFECYCLE_JOIN_TIMEOUT, join).await;
 }
 
 /// The one task that owns the child process for its entire lifetime, from
@@ -226,13 +239,51 @@ async fn run_lifecycle(app: AppHandle, handle: SupervisorHandle, token: Cancella
 
 /// The second half of the lifecycle, split out from [`run_lifecycle`]
 /// specifically so it's directly testable without a Tauri `AppHandle`:
-/// publishes `Ready`, then watches the child for the rest of its life,
-/// reacting to either an unexpected exit (S1-04 review finding 1) or a
-/// cancellation request (graceful shutdown) via one `tokio::select!`.
+/// publishes `Ready` (unless shutdown was already recorded -- see module
+/// docs), then watches the child for the rest of its life, reacting to
+/// either an unexpected exit (S1-04 review finding 1) or a cancellation
+/// request (graceful shutdown) via one `tokio::select!`.
 async fn watch_ready_process(
     handle: SupervisorHandle,
     handshake: HandshakeResult,
     token: CancellationToken,
+) {
+    watch_ready_process_inner(handle, handshake, token, PrePublishHook::noop()).await;
+}
+
+/// Test-only synchronization point immediately before readiness
+/// publication: lets a test park the lifecycle after the handshake has
+/// completed, record shutdown, and only then let publication proceed --
+/// forcing the startup-complete/publication boundary deterministically.
+/// Zero-sized and a no-op outside `cfg(test)`.
+#[derive(Default)]
+struct PrePublishHook {
+    #[cfg(test)]
+    pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+}
+
+impl PrePublishHook {
+    fn noop() -> Self {
+        Self::default()
+    }
+
+    async fn fire(self) {
+        #[cfg(test)]
+        if let Some((reached, resume)) = self.pause {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
+    }
+}
+
+async fn watch_ready_process_inner(
+    handle: SupervisorHandle,
+    handshake: HandshakeResult,
+    token: CancellationToken,
+    hook: PrePublishHook,
 ) {
     let HandshakeResult {
         process,
@@ -249,23 +300,31 @@ async fn watch_ready_process(
         job,
     } = process;
 
+    hook.fire().await;
+
     let (alive_tx, alive_rx) = watch::channel(true);
-    handle
-        .set_ready(ReadyConnection::new(
-            host,
-            port,
-            session_token,
-            pinned.clone(),
-            alive_rx,
-        ))
+    let published = handle
+        .set_ready(
+            ReadyConnection::new(host, port, session_token, pinned.clone(), alive_rx),
+            alive_tx,
+        )
         .await;
+    if !published {
+        // Shutdown was recorded before publication could happen: nothing
+        // was exposed. Stop the child the same way a normal shutdown does.
+        stop_child(&mut child, &mut stdin, &mut stdout).await;
+        handle.mark_stopped().await;
+        #[cfg(windows)]
+        drop(job);
+        return;
+    }
 
     tokio::select! {
         status = child.wait() => {
             debug_log("child exited unexpectedly", &status.map(|s| s.to_string()).unwrap_or_default());
-            // "Stop accepting frontend access immediately": flip the
-            // liveness signal before anything else, then reap/invalidate.
-            let _ = alive_tx.send(false);
+            // "Stop accepting frontend access immediately":
+            // `invalidate_ready` flips the liveness signal and clears the
+            // connection in one locked step.
             handle.invalidate_ready(FailureReason::ChildExitedUnexpectedly.as_str()).await;
         }
         () = pinned.closed() => {
@@ -276,27 +335,33 @@ async fn watch_ready_process(
             // proactively, rather than only discovering a dead connection
             // reactively the next time something tries to use it.
             debug_log("pinned connection to child lost", &"");
-            let _ = alive_tx.send(false);
             handle.invalidate_ready(FailureReason::AuthenticatedConnectionLost.as_str()).await;
         }
         () = token.cancelled() => {
-            let _ = alive_tx.send(false);
-            let _ = protocol::write_shutdown(&mut stdin).await;
-            // Best-effort confirmation only -- a missing/slow
-            // acknowledgement must never block the real shutdown signal
-            // below, which is the child actually exiting.
-            let _ = timeout(SHUTDOWN_ACK_TIMEOUT, protocol::read_shutdown_ack(&mut stdout)).await;
-
-            if timeout(SHUTDOWN_GRACE, child.wait()).await.is_err() {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
+            // `begin_shutdown` already revoked the connection when it
+            // recorded the request; this is the process-side cleanup.
+            stop_child(&mut child, &mut stdin, &mut stdout).await;
             handle.mark_stopped().await;
         }
     }
 
     #[cfg(windows)]
     drop(job);
+}
+
+/// Graceful stop: private-channel `shutdown`, bounded wait, then a forced
+/// kill if the child hasn't exited.
+async fn stop_child(child: &mut Child, stdin: &mut ChildStdin, stdout: &mut ChildStdout) {
+    let _ = protocol::write_shutdown(stdin).await;
+    // Best-effort confirmation only -- a missing/slow acknowledgement must
+    // never block the real shutdown signal below, which is the child
+    // actually exiting.
+    let _ = timeout(SHUTDOWN_ACK_TIMEOUT, protocol::read_shutdown_ack(stdout)).await;
+
+    if timeout(SHUTDOWN_GRACE, child.wait()).await.is_err() {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
 }
 
 struct SpawnedProcess {
@@ -493,32 +558,26 @@ async fn verify_identity(
         body,
     );
 
+    // One deadline covers the request and the whole bounded body read
+    // (S1-04 review round 3, finding 2 -- see `pinned_http` module docs).
     let response = pinned
-        .send(request, HTTP_REQUEST_TIMEOUT)
+        .send(request, MAX_HTTP_RESPONSE_BYTES, HTTP_REQUEST_TIMEOUT)
         .await
         .map_err(|e| {
             debug_log("challenge request failed", &e);
-            FailureReason::ChallengeRequestFailed
+            match e {
+                pinned_http::PinnedSendError::BodyTooLarge => {
+                    FailureReason::ChallengeResponseTooLarge
+                }
+                _ => FailureReason::ChallengeRequestFailed,
+            }
         })?;
 
-    if !response.status().is_success() {
+    if !response.status.is_success() {
         return Err(FailureReason::ChallengeResponseRejected);
     }
 
-    let body_bytes = pinned_http::read_bounded_body(
-        response.into_body(),
-        MAX_HTTP_RESPONSE_BYTES,
-        HTTP_REQUEST_TIMEOUT,
-    )
-    .await
-    .map_err(|e| match e {
-        pinned_http::ReadBodyError::TooLarge => FailureReason::ChallengeResponseTooLarge,
-        pinned_http::ReadBodyError::ReadFailed | pinned_http::ReadBodyError::TimedOut => {
-            FailureReason::ChallengeRequestFailed
-        }
-    })?;
-
-    let parsed: ChallengeResponseBody = serde_json::from_slice(&body_bytes)
+    let parsed: ChallengeResponseBody = serde_json::from_slice(&response.body)
         .map_err(|_| FailureReason::ChallengeResponseMalformed)?;
     let response_bytes =
         b64url::decode(&parsed.response).map_err(|_| FailureReason::ChallengeResponseMalformed)?;
@@ -648,42 +707,41 @@ async fn check_service_health_inner(
         .body(Full::new(Bytes::new()))
         .expect("request built from a fixed, valid set of headers");
 
+    // One deadline covers waiting for the connection (another health call
+    // may hold it), the request, and the whole bounded body read (S1-04
+    // review round 3, finding 2 -- see `pinned_http` module docs).
     #[cfg(test)]
     let sent = if bypass_liveness_flag {
         connection
             .pinned
-            .send_ignoring_liveness_flag(request, HTTP_REQUEST_TIMEOUT)
+            .send_ignoring_liveness_flag(request, MAX_HTTP_RESPONSE_BYTES, HTTP_REQUEST_TIMEOUT)
             .await
     } else {
-        connection.pinned.send(request, HTTP_REQUEST_TIMEOUT).await
+        connection
+            .pinned
+            .send(request, MAX_HTTP_RESPONSE_BYTES, HTTP_REQUEST_TIMEOUT)
+            .await
     };
     #[cfg(not(test))]
     let sent = {
         let _ = bypass_liveness_flag;
-        connection.pinned.send(request, HTTP_REQUEST_TIMEOUT).await
+        connection
+            .pinned
+            .send(request, MAX_HTTP_RESPONSE_BYTES, HTTP_REQUEST_TIMEOUT)
+            .await
     };
 
     let response = sent.map_err(|e| {
         debug_log("health request failed", &e);
-        HealthCheckError::RequestFailed
-    })?;
-
-    if !response.status().is_success() {
-        return Err(HealthCheckError::UnexpectedStatus);
-    }
-
-    let body_bytes = pinned_http::read_bounded_body(
-        response.into_body(),
-        MAX_HTTP_RESPONSE_BYTES,
-        HTTP_REQUEST_TIMEOUT,
-    )
-    .await
-    .map_err(|e| match e {
-        pinned_http::ReadBodyError::TooLarge => HealthCheckError::ResponseTooLarge,
-        pinned_http::ReadBodyError::ReadFailed | pinned_http::ReadBodyError::TimedOut => {
-            HealthCheckError::RequestFailed
+        match e {
+            pinned_http::PinnedSendError::BodyTooLarge => HealthCheckError::ResponseTooLarge,
+            _ => HealthCheckError::RequestFailed,
         }
     })?;
+
+    if !response.status.is_success() {
+        return Err(HealthCheckError::UnexpectedStatus);
+    }
 
     // The connection cannot have silently reconnected to anything else in
     // between -- but it can have gone from alive to dead while this
@@ -693,7 +751,7 @@ async fn check_service_health_inner(
         return Err(HealthCheckError::ServiceNoLongerAlive);
     }
 
-    serde_json::from_slice(&body_bytes).map_err(|_| HealthCheckError::ResponseMalformed)
+    serde_json::from_slice(&response.body).map_err(|_| HealthCheckError::ResponseMalformed)
 }
 
 /// Continuously drains the child's stderr so it can never fill its pipe
@@ -830,10 +888,14 @@ mod tests {
             .unwrap();
         let unauthed = connection
             .pinned
-            .send(unauthed_request, HTTP_REQUEST_TIMEOUT)
+            .send(
+                unauthed_request,
+                MAX_HTTP_RESPONSE_BYTES,
+                HTTP_REQUEST_TIMEOUT,
+            )
             .await
             .unwrap();
-        assert_eq!(unauthed.status(), 401);
+        assert_eq!(unauthed.status, 401);
 
         token.cancel();
         watcher.await.expect("watcher task should not panic");
@@ -1057,10 +1119,18 @@ mod tests {
             .unwrap();
 
         let token = CancellationToken::new();
-        assert!(handle.arm(token.clone()).await);
-        let join =
-            tauri::async_runtime::spawn(watch_ready_process(handle.clone(), handshake, token));
-        handle.set_lifecycle_task(join).await;
+        let (handle_for_task, token_for_task) = (handle.clone(), token.clone());
+        assert!(
+            handle
+                .arm_and_spawn(token, move || {
+                    tauri::async_runtime::spawn(watch_ready_process(
+                        handle_for_task,
+                        handshake,
+                        token_for_task,
+                    ))
+                })
+                .await
+        );
 
         assert!(
             poll_state(
@@ -1098,6 +1168,144 @@ mod tests {
         // scheduling), but Ready must never be observable afterward.
         let _ = raced;
         assert!(handle.ready_connection().await.is_none());
+    }
+
+    // --- S1-04 review round 3, finding 1: shutdown vs. publication -------
+
+    /// Forces the exact boundary from the review: the handshake has
+    /// completed (startup won `select!`) and the lifecycle is about to
+    /// publish `Ready`, when shutdown is recorded. Driven through the real
+    /// `shutdown` function and the real publication path
+    /// (`watch_ready_process_inner`), with channels rather than sleeps.
+    #[tokio::test]
+    async fn shutdown_at_the_publication_boundary_never_publishes_ready() {
+        let (executable, args) = real_dev_target();
+        let handle = SupervisorHandle::new();
+        let handshake = run_startup_with_executable(&handle, &executable, &args)
+            .await
+            .expect("startup should succeed");
+        let port = handshake.port;
+        let pid = handshake
+            .process
+            .child
+            .id()
+            .expect("child should have a pid");
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let token = CancellationToken::new();
+        let (handle_for_task, token_for_task) = (handle.clone(), token.clone());
+        assert!(
+            handle
+                .arm_and_spawn(token.clone(), move || {
+                    tauri::async_runtime::spawn(watch_ready_process_inner(
+                        handle_for_task,
+                        handshake,
+                        token_for_task,
+                        PrePublishHook {
+                            pause: Some((reached_tx, resume_rx)),
+                        },
+                    ))
+                })
+                .await
+        );
+
+        // Startup is complete and the lifecycle is parked right before
+        // publication.
+        reached_rx
+            .await
+            .expect("lifecycle must reach the publication point");
+        assert_ne!(handle.snapshot().await, SupervisorState::Ready);
+
+        // Shutdown wins the boundary: run the real `shutdown`, and wait
+        // until it has recorded the request (it cancels the token only
+        // after recording it under the handle's lock).
+        let shutdown_handle = handle.clone();
+        let shutdown_task = tokio::spawn(async move { shutdown(&shutdown_handle).await });
+        token.cancelled().await;
+
+        // Now let publication proceed.
+        let _ = resume_tx.send(());
+        timeout(Duration::from_secs(15), shutdown_task)
+            .await
+            .expect("shutdown must finish")
+            .expect("shutdown must not panic");
+
+        assert!(
+            !handle.ever_published_ready().await,
+            "Ready must never be published once shutdown is recorded"
+        );
+        assert_eq!(handle.snapshot().await, SupervisorState::Stopped);
+        assert!(handle.ready_connection().await.is_none());
+
+        // The child was stopped, not left running: its port is released
+        // and its pid is gone.
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err());
+        assert!(!process_is_running(pid));
+    }
+
+    /// The opposite ordering at the same boundary: `Ready` is published
+    /// first, then shutdown is recorded. A connection obtained while Ready
+    /// must be revoked at the moment shutdown is recorded -- not only once
+    /// the lifecycle task gets around to stopping the child.
+    #[tokio::test]
+    async fn shutdown_recorded_after_publication_revokes_the_connection_immediately() {
+        let (executable, args) = real_dev_target();
+        let handle = SupervisorHandle::new();
+        let handshake = run_startup_with_executable(&handle, &executable, &args)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let (handle_for_task, token_for_task) = (handle.clone(), token.clone());
+        assert!(
+            handle
+                .arm_and_spawn(token, move || {
+                    tauri::async_runtime::spawn(watch_ready_process(
+                        handle_for_task,
+                        handshake,
+                        token_for_task,
+                    ))
+                })
+                .await
+        );
+        assert!(
+            poll_state(
+                &handle,
+                |s| *s == SupervisorState::Ready,
+                Duration::from_secs(5)
+            )
+            .await
+        );
+        let connection = handle.ready_connection().await.unwrap();
+        assert!(connection.is_alive());
+
+        // Record shutdown without yet cancelling the lifecycle task: the
+        // child is still running and the pinned socket still open, yet
+        // nothing may use the connection any more.
+        let (cancel, join) = handle.begin_shutdown().await.unwrap();
+        assert!(handle.ready_connection().await.is_none());
+        assert!(!connection.is_alive());
+        assert_eq!(
+            check_service_health(&connection).await.unwrap_err(),
+            HealthCheckError::ServiceNoLongerAlive
+        );
+
+        cancel.cancel();
+        timeout(LIFECYCLE_JOIN_TIMEOUT, join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.snapshot().await, SupervisorState::Stopped);
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist should run");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
     }
 
     // --- S1-04 review finding 1: child death revokes the connection ------
@@ -1396,18 +1604,12 @@ mod tests {
             .header("Connection", "close")
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let response = child
+        child
             .connection
             .pinned
-            .send(close_request, HTTP_REQUEST_TIMEOUT)
+            .send(close_request, MAX_HTTP_RESPONSE_BYTES, HTTP_REQUEST_TIMEOUT)
             .await
             .expect("live child answers");
-        let _ = pinned_http::read_bounded_body(
-            response.into_body(),
-            MAX_HTTP_RESPONSE_BYTES,
-            HTTP_REQUEST_TIMEOUT,
-        )
-        .await;
 
         wait_for_failed(&child.handle).await;
         assert_eq!(

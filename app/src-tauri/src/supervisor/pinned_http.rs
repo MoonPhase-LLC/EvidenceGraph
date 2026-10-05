@@ -23,6 +23,20 @@
 //! client (the prior design) could not give this guarantee no matter how
 //! its pool size or liveness checks were tuned.
 //!
+//! **One deadline per call** (S1-04 review round 3, finding 2): every
+//! call to [`PinnedConnection::send`] is bounded by a single deadline,
+//! fixed when the call starts, that covers waiting for the connection
+//! (calls are serialized -- HTTP/1.1 has no multiplexing), the request
+//! itself, and reading the full response body. A call that is still
+//! queued when its deadline passes returns `TimedOut` without ever having
+//! owned the connection: it wrote nothing, so the connection is left
+//! exactly as it was, for whichever caller holds it. A call that fails
+//! *after* taking ownership -- deadline, oversized or unreadable body,
+//! transport error -- leaves the HTTP/1.1 exchange in an unknown state,
+//! so it aborts the connection before releasing it (fail closed): the
+//! socket is dropped, [`PinnedConnection::is_alive`] goes false, and
+//! every later call fails without I/O. Nothing redials.
+//!
 //! Deliberately **not** using `reqwest` here: even with connection pooling
 //! disabled, `reqwest::Client::get(...).send()` still dials a fresh
 //! connection per call by design -- there is no `reqwest` API for "reuse
@@ -34,13 +48,14 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
-use hyper::{Request, Response};
+use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinnedConnectError {
@@ -73,7 +88,13 @@ pub enum PinnedSendError {
     /// `send_request` itself failed (connection reset, broken pipe, the
     /// background driver task already ended, ...).
     Rejected,
+    /// The call's single deadline passed -- while queued for the
+    /// connection, mid-request, or mid-body.
     TimedOut,
+    /// The response body exceeded the caller's byte limit.
+    BodyTooLarge,
+    /// The response body could not be read to completion.
+    BodyReadFailed,
 }
 
 impl std::fmt::Display for PinnedSendError {
@@ -82,6 +103,8 @@ impl std::fmt::Display for PinnedSendError {
             Self::AlreadyClosed => "already_closed",
             Self::Rejected => "rejected",
             Self::TimedOut => "timed_out",
+            Self::BodyTooLarge => "body_too_large",
+            Self::BodyReadFailed => "body_read_failed",
         };
         f.write_str(s)
     }
@@ -97,6 +120,16 @@ impl std::fmt::Display for PinnedSendError {
 pub struct PinnedConnection {
     sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
     alive: watch::Receiver<bool>,
+    /// Cancelled to tear the connection down deliberately (fail closed)
+    /// -- see module docs. The driver task drops the socket when it fires.
+    abort: CancellationToken,
+}
+
+/// A fully read response: status plus the complete, size-bounded body.
+#[derive(Debug)]
+pub struct PinnedResponse {
+    pub status: StatusCode,
+    pub body: Vec<u8>,
 }
 
 impl PinnedConnection {
@@ -125,20 +158,28 @@ impl PinnedConnection {
             .map_err(|_| PinnedConnectError::Handshake)?;
 
         let (alive_tx, alive_rx) = watch::channel(true);
+        let abort = CancellationToken::new();
+        let abort_driver = abort.clone();
         // Drives the connection for as long as it lives. This is the only
         // task anywhere that ever touches this TCP stream's I/O; when it
         // returns (cleanly or via an error -- both are folded together,
         // since a raw `hyper::Error` here could carry a peer-controlled
         // detail string, and finding 4 requires never logging/exposing
-        // that), the connection is permanently gone.
+        // that), or is aborted (dropping `conn` closes the socket), the
+        // connection is permanently gone.
         tokio::spawn(async move {
-            let _ = conn.await;
+            tokio::select! {
+                biased;
+                () = abort_driver.cancelled() => {}
+                _ = conn => {}
+            }
             let _ = alive_tx.send(false);
         });
 
         Ok(Self {
             sender: Arc::new(Mutex::new(sender)),
             alive: alive_rx,
+            abort,
         })
     }
 
@@ -150,7 +191,7 @@ impl PinnedConnection {
     /// never target anything other than this exact already-established
     /// socket.
     pub fn is_alive(&self) -> bool {
-        *self.alive.borrow()
+        !self.abort.is_cancelled() && *self.alive.borrow()
     }
 
     /// Resolves once this connection is observed closed -- lets a caller
@@ -159,28 +200,36 @@ impl PinnedConnection {
     /// rather than only discovering it reactively at the next request.
     pub async fn closed(&self) {
         let mut alive = self.alive.clone();
-        while *alive.borrow() {
-            if alive.changed().await.is_err() {
-                return;
-            }
+        tokio::select! {
+            () = self.abort.cancelled() => {}
+            () = async {
+                while *alive.borrow() {
+                    if alive.changed().await.is_err() {
+                        return;
+                    }
+                }
+            } => {}
         }
     }
 
-    /// Sends a request over this exact connection and returns the
-    /// response, unread. Never dials anything -- if the connection is
-    /// already closed, this fails immediately without attempting I/O; if
-    /// it closes concurrently with the attempt, the underlying write
-    /// fails and that failure is surfaced here, not silently retried
-    /// against a new connection.
+    /// Sends a request over this exact connection and reads the whole
+    /// response body (at most `max_body_bytes`), all within one deadline
+    /// of `request_timeout` from now -- see module docs. Never dials
+    /// anything -- if the connection is already closed, this fails
+    /// immediately without attempting I/O; if it closes concurrently with
+    /// the attempt, the underlying write fails and that failure is
+    /// surfaced here, not silently retried against a new connection.
     pub async fn send(
         &self,
         request: Request<Full<Bytes>>,
+        max_body_bytes: usize,
         request_timeout: Duration,
-    ) -> Result<Response<Incoming>, PinnedSendError> {
+    ) -> Result<PinnedResponse, PinnedSendError> {
         if !self.is_alive() {
             return Err(PinnedSendError::AlreadyClosed);
         }
-        self.send_on_connection(request, request_timeout).await
+        self.send_on_connection(request, max_body_bytes, request_timeout, true)
+            .await
     }
 
     /// Test-only: performs the I/O half of [`send`](Self::send) *without*
@@ -193,68 +242,88 @@ impl PinnedConnection {
     pub(super) async fn send_ignoring_liveness_flag(
         &self,
         request: Request<Full<Bytes>>,
+        max_body_bytes: usize,
         request_timeout: Duration,
-    ) -> Result<Response<Incoming>, PinnedSendError> {
-        self.send_on_connection(request, request_timeout).await
+    ) -> Result<PinnedResponse, PinnedSendError> {
+        self.send_on_connection(request, max_body_bytes, request_timeout, false)
+            .await
     }
 
     async fn send_on_connection(
         &self,
         request: Request<Full<Bytes>>,
+        max_body_bytes: usize,
         request_timeout: Duration,
-    ) -> Result<Response<Incoming>, PinnedSendError> {
-        let mut sender = self.sender.lock().await;
-        timeout(request_timeout, async {
+        check_abort: bool,
+    ) -> Result<PinnedResponse, PinnedSendError> {
+        let deadline = Instant::now() + request_timeout;
+
+        // Queued behind another call: the wait counts against this call's
+        // deadline. Timing out here drops only the pending lock
+        // acquisition (cancel-safe) -- nothing was written, so the
+        // connection is untouched and stays usable by its current owner.
+        let Ok(mut sender) = timeout_at(deadline, self.sender.lock()).await else {
+            return Err(PinnedSendError::TimedOut);
+        };
+
+        // A previous owner may have aborted the connection while this
+        // call was queued; the driver task may not have dropped the
+        // socket yet, so check the abort itself rather than the flag.
+        if check_abort && self.abort.is_cancelled() {
+            return Err(PinnedSendError::AlreadyClosed);
+        }
+
+        let result = timeout_at(deadline, async {
             sender
                 .ready()
                 .await
                 .map_err(|_| PinnedSendError::Rejected)?;
-            sender
+            let response = sender
                 .send_request(request)
                 .await
-                .map_err(|_| PinnedSendError::Rejected)
+                .map_err(|_| PinnedSendError::Rejected)?;
+            let status = response.status();
+            let body = read_bounded_body(response.into_body(), max_body_bytes).await?;
+            Ok(PinnedResponse { status, body })
         })
         .await
-        .map_err(|_| PinnedSendError::TimedOut)?
+        .unwrap_or(Err(PinnedSendError::TimedOut));
+
+        if result.is_err() {
+            // Fail closed while still holding the sender, so no queued
+            // call can start an exchange on a connection whose request/
+            // response state is now unknown.
+            self.abort.cancel();
+        }
+        drop(sender);
+        result
     }
 }
 
 /// Reads a response body incrementally, enforcing `max_bytes` against
 /// bytes *actually received* -- never `Content-Length`, mirroring the
 /// same bounded-read discipline the prior `reqwest`-based implementation
-/// used (S1-04 review finding 3). `read_timeout` bounds the *whole* body
-/// read, so a responder that sends headers and then stalls or trickles
-/// bytes cannot hang the caller -- the old client's overall request timeout
-/// covered the body, and `send`'s timeout only covers up to the headers.
-pub async fn read_bounded_body(
+/// used (S1-04 review finding 3). Has no deadline of its own: it only
+/// ever runs inside [`PinnedConnection::send`]'s single per-call
+/// deadline, so a responder that sends headers and then stalls or
+/// trickles bytes cannot hang the caller.
+async fn read_bounded_body(
     mut body: Incoming,
     max_bytes: usize,
-    read_timeout: Duration,
-) -> Result<Vec<u8>, ReadBodyError> {
-    timeout(read_timeout, async {
-        let mut buf = Vec::new();
-        loop {
-            let Some(frame) = body.frame().await else {
-                return Ok(buf);
-            };
-            let frame = frame.map_err(|_| ReadBodyError::ReadFailed)?;
-            if let Some(data) = frame.data_ref() {
-                buf.extend_from_slice(data);
-                if buf.len() > max_bytes {
-                    return Err(ReadBodyError::TooLarge);
-                }
+) -> Result<Vec<u8>, PinnedSendError> {
+    let mut buf = Vec::new();
+    loop {
+        let Some(frame) = body.frame().await else {
+            return Ok(buf);
+        };
+        let frame = frame.map_err(|_| PinnedSendError::BodyReadFailed)?;
+        if let Some(data) = frame.data_ref() {
+            buf.extend_from_slice(data);
+            if buf.len() > max_bytes {
+                return Err(PinnedSendError::BodyTooLarge);
             }
         }
-    })
-    .await
-    .map_err(|_| ReadBodyError::TimedOut)?
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadBodyError {
-    ReadFailed,
-    TimedOut,
-    TooLarge,
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +331,8 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    const BODY: usize = 4096;
 
     async fn respond_once(listener: TcpListener, response: &'static str) {
         if let Ok((mut socket, _)) = listener.accept().await {
@@ -297,15 +368,13 @@ mod tests {
         let response = conn
             .send(
                 get_request("127.0.0.1", addr.port(), "/health"),
+                BODY,
                 Duration::from_secs(3),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), 200);
-        let body = read_bounded_body(response.into_body(), 4096, Duration::from_secs(3))
-            .await
-            .unwrap();
-        assert_eq!(body, b"ok");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
     }
 
     #[tokio::test]
@@ -367,6 +436,7 @@ mod tests {
         let result = conn
             .send(
                 get_request("127.0.0.1", addr.port(), "/health"),
+                BODY,
                 Duration::from_secs(2),
             )
             .await;
@@ -412,14 +482,13 @@ mod tests {
             let response = conn
                 .send(
                     get_request("127.0.0.1", addr.port(), "/health"),
+                    BODY,
                     Duration::from_secs(3),
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), 200);
-            let _ = read_bounded_body(response.into_body(), 4096, Duration::from_secs(3))
-                .await
-                .unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"ok");
         }
 
         assert_eq!(accept_count.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -517,6 +586,7 @@ mod tests {
         let result = conn
             .send_ignoring_liveness_flag(
                 authorized_request("127.0.0.1", port),
+                BODY,
                 Duration::from_secs(2),
             )
             .await;
@@ -556,6 +626,7 @@ mod tests {
         let result = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
+                BODY,
                 Duration::from_secs(3),
             )
             .await;
@@ -598,11 +669,12 @@ mod tests {
         let first = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
+                BODY,
                 Duration::from_secs(3),
             )
             .await
             .unwrap();
-        let _ = read_bounded_body(first.into_body(), 4096, Duration::from_secs(3)).await;
+        assert_eq!(first.body, b"ok");
 
         tokio::time::timeout(Duration::from_secs(2), conn.closed())
             .await
@@ -610,6 +682,7 @@ mod tests {
         let second = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
+                BODY,
                 Duration::from_secs(3),
             )
             .await;
@@ -617,6 +690,7 @@ mod tests {
         let second_ignoring_flag = conn
             .send_ignoring_liveness_flag(
                 get_request("127.0.0.1", port, "/health"),
+                BODY,
                 Duration::from_secs(3),
             )
             .await;
@@ -628,9 +702,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_response_body_is_bounded_by_the_read_timeout() {
-        // Headers arrive, then the body stalls forever. `send`'s timeout
-        // only covers up to the headers, so without a deadline on the body
-        // read a hostile or hung responder could hang the caller.
+        // Headers arrive, then the body stalls forever. The call's single
+        // deadline covers the body too, so a hostile or hung responder
+        // cannot hang the caller after sending headers.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -652,19 +726,19 @@ ab",
         let conn = PinnedConnection::connect("127.0.0.1", port, Duration::from_secs(3))
             .await
             .unwrap();
-        let response = conn
+        let started = std::time::Instant::now();
+        let result = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
-                Duration::from_secs(3),
+                BODY,
+                Duration::from_millis(300),
             )
-            .await
-            .unwrap();
-
-        let started = std::time::Instant::now();
-        let result =
-            read_bounded_body(response.into_body(), 4096, Duration::from_millis(300)).await;
-        assert_eq!(result, Err(ReadBodyError::TimedOut));
+            .await;
+        assert_eq!(result.err(), Some(PinnedSendError::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(2));
+        // Fail closed: a mid-body timeout leaves the exchange in an
+        // unknown state, so the connection is torn down.
+        assert!(!conn.is_alive());
     }
 
     #[tokio::test]
@@ -697,16 +771,16 @@ Content-Length: 1000
         let conn = PinnedConnection::connect("127.0.0.1", port, Duration::from_secs(3))
             .await
             .unwrap();
-        let response = conn
+        let started = std::time::Instant::now();
+        let result = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
-                Duration::from_secs(3),
+                BODY,
+                Duration::from_millis(400),
             )
-            .await
-            .unwrap();
-        let result =
-            read_bounded_body(response.into_body(), 4096, Duration::from_millis(400)).await;
-        assert_eq!(result, Err(ReadBodyError::TimedOut));
+            .await;
+        assert_eq!(result.err(), Some(PinnedSendError::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -735,6 +809,7 @@ Content-Length: 1000
         let first = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
+                BODY,
                 Duration::from_millis(300),
             )
             .await;
@@ -752,6 +827,7 @@ Content-Length: 1000
         let second = conn
             .send(
                 get_request("127.0.0.1", port, "/health"),
+                BODY,
                 Duration::from_millis(500),
             )
             .await;
@@ -759,5 +835,320 @@ Content-Length: 1000
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_fails_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(respond_once(
+            listener,
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789",
+        ));
+        let conn = PinnedConnection::connect("127.0.0.1", port, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let result = conn
+            .send(
+                get_request("127.0.0.1", port, "/health"),
+                4,
+                Duration::from_secs(3),
+            )
+            .await;
+        assert_eq!(result.err(), Some(PinnedSendError::BodyTooLarge));
+        assert!(!conn.is_alive());
+    }
+
+    // --- S1-04 review round 3, finding 2: one deadline per call ----------
+
+    /// Serves requests on the one accepted connection, sequentially, each
+    /// answered `delay` after it's fully received. Reports each request's
+    /// arrival on `arrivals`, and counts accepted connections.
+    struct SlowServer {
+        port: u16,
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    }
+
+    impl SlowServer {
+        async fn start(delay: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let accepted_clone = accepted.clone();
+            let (arrival_tx, arrivals) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let arrival_tx = arrival_tx.clone();
+                    tokio::spawn(async move {
+                        let mut pending = Vec::new();
+                        let mut buf = vec![0u8; 4096];
+                        loop {
+                            // Each test request is a body-less GET, so one
+                            // request ends at each blank line.
+                            while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                pending.drain(..end + 4);
+                                let _ = arrival_tx.send(());
+                                tokio::time::sleep(delay).await;
+                                if socket
+                                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                port,
+                accepted,
+                arrivals,
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Generous allowance for scheduler jitter on a loaded CI machine --
+    /// still far below the extra time a queued call would take if its
+    /// deadline only started once it owned the connection.
+    const SCHEDULING_TOLERANCE: Duration = Duration::from_millis(250);
+
+    #[tokio::test]
+    async fn queued_calls_respect_their_overall_deadline() {
+        // Each request takes 400ms to answer. Three concurrent calls, each
+        // with a 600ms budget. The first owns the connection and finishes
+        // at ~400ms. Under the old behaviour (timeout started only after
+        // acquiring the lock) the second would finish at ~800ms and the
+        // third at ~1200ms -- both well past their 600ms budget.
+        let mut server = SlowServer::start(Duration::from_millis(400)).await;
+        let conn = PinnedConnection::connect("127.0.0.1", server.port, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let budget = Duration::from_millis(600);
+
+        let first = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let r = conn
+                    .send(get_request("127.0.0.1", port, "/health"), BODY, budget)
+                    .await;
+                (r, started.elapsed())
+            })
+        };
+        // The first call has written its request (so owns the sender)
+        // before the others are queued behind it.
+        server.arrivals.recv().await.unwrap();
+
+        let queued: Vec<_> = (0..2)
+            .map(|_| {
+                let conn = conn.clone();
+                let port = server.port;
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let r = conn
+                        .send(get_request("127.0.0.1", port, "/health"), BODY, budget)
+                        .await;
+                    (r, started.elapsed())
+                })
+            })
+            .collect();
+
+        let (first_result, first_elapsed) = first.await.unwrap();
+        assert_eq!(first_result.unwrap().body, b"ok");
+        assert!(first_elapsed < budget + SCHEDULING_TOLERANCE);
+
+        for task in queued {
+            let (result, elapsed) = task.await.unwrap();
+            assert!(
+                result.is_err(),
+                "a queued call cannot finish a 400ms request inside the time left of its 600ms budget"
+            );
+            assert!(
+                elapsed < budget + SCHEDULING_TOLERANCE,
+                "queued call took {elapsed:?}, budget {budget:?}"
+            );
+        }
+
+        // The connection is never left locked: a later call returns
+        // promptly (it may fail closed -- one queued call timed out after
+        // owning the connection -- but must not hang).
+        let started = std::time::Instant::now();
+        let _ = conn
+            .send(
+                get_request("127.0.0.1", server.port, "/health"),
+                BODY,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(server.accepted(), 1, "no redial");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_times_out_while_queued_leaves_the_connection_usable() {
+        // The queued call's deadline expires while another call owns the
+        // connection. It wrote nothing, so it must not abort or otherwise
+        // disturb the connection: the owner completes normally and later
+        // calls still work over the same connection.
+        let mut server = SlowServer::start(Duration::from_millis(500)).await;
+        let conn = PinnedConnection::connect("127.0.0.1", server.port, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        let owner = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                conn.send(
+                    get_request("127.0.0.1", port, "/health"),
+                    BODY,
+                    Duration::from_secs(3),
+                )
+                .await
+            })
+        };
+        server.arrivals.recv().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let queued = conn
+            .send(
+                get_request("127.0.0.1", server.port, "/health"),
+                BODY,
+                Duration::from_millis(150),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(queued.err(), Some(PinnedSendError::TimedOut));
+        assert!(elapsed < Duration::from_millis(150) + SCHEDULING_TOLERANCE);
+        assert!(
+            conn.is_alive(),
+            "a call that never owned the connection must not tear it down"
+        );
+
+        assert_eq!(owner.await.unwrap().unwrap().body, b"ok");
+        assert!(conn.is_alive());
+
+        let after = conn
+            .send(
+                get_request("127.0.0.1", server.port, "/health"),
+                BODY,
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("the connection is still usable after a queued call timed out");
+        assert_eq!(after.body, b"ok");
+        assert_eq!(server.accepted(), 1, "no redial");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_queued_call_does_not_leave_the_connection_locked() {
+        // Dropping a call (e.g. the frontend command's task is cancelled)
+        // while it's queued for the connection must release its place.
+        let mut server = SlowServer::start(Duration::from_millis(200)).await;
+        let conn = PinnedConnection::connect("127.0.0.1", server.port, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        let owner = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                conn.send(
+                    get_request("127.0.0.1", port, "/health"),
+                    BODY,
+                    Duration::from_secs(3),
+                )
+                .await
+            })
+        };
+        server.arrivals.recv().await.unwrap();
+
+        let queued = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                conn.send(
+                    get_request("127.0.0.1", port, "/health"),
+                    BODY,
+                    Duration::from_secs(3),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        queued.abort();
+        let _ = queued.await;
+
+        assert_eq!(owner.await.unwrap().unwrap().body, b"ok");
+        let after = conn
+            .send(
+                get_request("127.0.0.1", server.port, "/health"),
+                BODY,
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("connection must not be left locked by a cancelled call");
+        assert_eq!(after.body, b"ok");
+        assert_eq!(server.accepted(), 1, "no redial");
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_timeout_fails_queued_calls_closed_without_io() {
+        // The owner times out mid-request and aborts the connection while
+        // still holding it. A call queued behind it must then fail without
+        // writing anything -- the server sees exactly one request.
+        let mut server = SlowServer::start(Duration::from_secs(5)).await;
+        let conn = PinnedConnection::connect("127.0.0.1", server.port, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        let owner = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                conn.send(
+                    get_request("127.0.0.1", port, "/health"),
+                    BODY,
+                    Duration::from_millis(300),
+                )
+                .await
+            })
+        };
+        server.arrivals.recv().await.unwrap();
+
+        let queued = conn
+            .send(
+                get_request("127.0.0.1", server.port, "/health"),
+                BODY,
+                Duration::from_secs(3),
+            )
+            .await;
+        assert_eq!(owner.await.unwrap().err(), Some(PinnedSendError::TimedOut));
+        assert_eq!(queued.err(), Some(PinnedSendError::AlreadyClosed));
+        assert!(!conn.is_alive());
+        tokio::time::timeout(Duration::from_secs(2), conn.closed())
+            .await
+            .expect("aborted connection is observed closed");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            server.arrivals.try_recv().is_err(),
+            "the queued request must never reach the wire"
+        );
+        assert_eq!(server.accepted(), 1, "no redial");
     }
 }

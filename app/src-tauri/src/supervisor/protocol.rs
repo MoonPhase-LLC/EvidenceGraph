@@ -123,13 +123,23 @@ impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
     }
 }
 
+/// Parses `bytes` as exactly one JSON object. `deserialize_any` alone
+/// stops after the first complete value and ignores whatever follows it,
+/// so `{"v":1,"type":"ready"}garbage` (or a second JSON value) would be
+/// accepted (S1-04 review round 3, finding 3); `Deserializer::end` then
+/// requires the rest of the frame to be JSON whitespace only -- the same
+/// rule Python's `json.loads` applies on the other side of the channel.
 fn parse_object_rejecting_duplicates(bytes: &[u8]) -> Result<Map<String, Value>, ProtocolError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    match deserializer.deserialize_any(NoDuplicateKeysVisitor) {
-        Ok(map) => Ok(map),
-        Err(e) if e.is_syntax() || e.is_eof() => Err(ProtocolError::FrameNotValidJson),
-        Err(_) => Err(ProtocolError::FrameMalformedObject),
-    }
+    let map = match deserializer.deserialize_any(NoDuplicateKeysVisitor) {
+        Ok(map) => map,
+        Err(e) if e.is_syntax() || e.is_eof() => return Err(ProtocolError::FrameNotValidJson),
+        Err(_) => return Err(ProtocolError::FrameMalformedObject),
+    };
+    deserializer
+        .end()
+        .map_err(|_| ProtocolError::FrameNotValidJson)?;
+    Ok(map)
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(
@@ -416,6 +426,76 @@ mod tests {
         buf.extend_from_slice(payload);
         let mut cursor = Cursor::new(buf);
         assert!(read_endpoint_ready(&mut cursor).await.is_err());
+    }
+
+    fn raw_frame(payload: &[u8]) -> Cursor<Vec<u8>> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+        Cursor::new(buf)
+    }
+
+    // --- S1-04 review round 3, finding 3: whole-frame consumption ---------
+
+    #[tokio::test]
+    async fn read_frame_rejects_trailing_garbage() {
+        let mut cursor = raw_frame(b"{\"v\":1,\"type\":\"ready\"}garbage");
+        assert_eq!(
+            read_ready(&mut cursor).await,
+            Err(ProtocolError::FrameNotValidJson)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_a_second_json_value() {
+        for payload in [
+            &b"{\"v\":1,\"type\":\"ready\"}{\"v\":1,\"type\":\"ready\"}"[..],
+            &b"{\"v\":1,\"type\":\"ready\"} {}"[..],
+            &b"{\"v\":1,\"type\":\"ready\"}\n1"[..],
+            &b"{\"v\":1,\"type\":\"ready\"}null"[..],
+        ] {
+            let mut cursor = raw_frame(payload);
+            assert_eq!(
+                read_ready(&mut cursor).await,
+                Err(ProtocolError::FrameNotValidJson),
+                "payload {:?} must be rejected",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_trailing_garbage_on_endpoint_ready() {
+        let mut cursor =
+            raw_frame(b"{\"v\":1,\"type\":\"endpoint_ready\",\"host\":\"127.0.0.1\",\"port\":1}x");
+        assert!(read_endpoint_ready(&mut cursor).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_frame_accepts_trailing_json_whitespace() {
+        let mut cursor = raw_frame(b"{\"v\":1,\"type\":\"ready\"} \t\r\n");
+        read_ready(&mut cursor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_trailing_non_json_whitespace() {
+        // Vertical tab / NUL are not JSON whitespace.
+        for payload in [
+            &b"{\"v\":1,\"type\":\"ready\"}\x0b"[..],
+            &b"{\"v\":1,\"type\":\"ready\"}\x00"[..],
+        ] {
+            let mut cursor = raw_frame(payload);
+            assert!(read_ready(&mut cursor).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_garbage_does_not_mask_a_duplicate_key() {
+        let mut cursor = raw_frame(b"{\"v\":1,\"v\":1,\"type\":\"ready\"} ");
+        assert_eq!(
+            read_ready(&mut cursor).await,
+            Err(ProtocolError::FrameMalformedObject)
+        );
     }
 
     #[tokio::test]

@@ -902,6 +902,12 @@ establish this; a check followed by an independent dial cannot close the race.
 - Requests share the one connection through a mutex (one in flight at a time). The current traffic
   (a startup challenge and `/health`) does not need more; revisit if high-volume requests are
   routed through it.
+- Each request has one deadline, set when the call starts, covering the wait for the mutex, the
+  request, and the full bounded body read (S1-04 review round 3). A call whose deadline passes while
+  it is still waiting for the mutex fails with nothing written and leaves the connection as it was.
+  A call that fails after acquiring the mutex (deadline, oversized or unreadable body, transport
+  error) aborts the connection before releasing the mutex, because the HTTP/1.1 exchange is then in
+  an unknown state. That is a connection loss, handled as above.
 
 **Limitations (accepted, not hidden):**
 - After 7 days of *complete* idleness the server would close the connection and the app fails closed

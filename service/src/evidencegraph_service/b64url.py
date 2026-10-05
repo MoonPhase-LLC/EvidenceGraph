@@ -41,16 +41,26 @@ def decode(value: object, *, field: str) -> bytes:
     *before* ever calling into the decoder -- never a best-effort decode
     of untrusted input. Also rejects a *padded* value: `TOKEN_PATTERN`
     excludes `=`, so canonical unpadded encoding is the only accepted
-    textual form, not merely one this happens to produce."""
+    textual form, not merely one this happens to produce.
+
+    Also rejects a *non-canonical* value: when the encoded length is not a
+    multiple of 4, the last character carries unused low-order bits, and
+    the stdlib decoder silently ignores them -- so e.g. `"A" * 21 + "B"`
+    and `"A" * 22` would both decode to 16 zero bytes. Requiring the
+    decoded bytes to re-encode to exactly `value` gives every byte string
+    one and only one accepted textual form."""
     if not isinstance(value, str) or not value or len(value) > MAX_FIELD_LENGTH:
         raise DecodeError(f"{field}_invalid_length")
     if not TOKEN_PATTERN.fullmatch(value):
         raise DecodeError(f"{field}_invalid_encoding")
     padded = value + "=" * (-len(value) % 4)
     try:
-        return base64.urlsafe_b64decode(padded)
+        raw = base64.urlsafe_b64decode(padded)
     except ValueError as exc:  # binascii.Error subclasses ValueError
         raise DecodeError(f"{field}_invalid_encoding") from exc
+    if encode(raw) != value:
+        raise DecodeError(f"{field}_invalid_encoding")
+    return raw
 
 
 def decode_exact(value: object, *, field: str, expected_length: int) -> bytes:

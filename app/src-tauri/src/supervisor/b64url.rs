@@ -34,6 +34,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nonzero_unused_bits_like_the_python_decoder() {
+        // Mirrors `service/tests/test_b64url.py`'s canonical-encoding
+        // cases: the `base64` crate's default engine config already
+        // rejects trailing bits, which this pins down.
+        assert!(decode(&("A".repeat(21) + "B")).is_err());
+        assert!(decode(&("A".repeat(42) + "B")).is_err());
+        assert_eq!(decode(&"A".repeat(22)).unwrap(), vec![0u8; 16]);
+        assert_eq!(decode(&"A".repeat(43)).unwrap(), vec![0u8; 32]);
+    }
+
+    #[test]
     fn matches_a_known_python_encoded_value() {
         // `python -c "import base64; print(base64.urlsafe_b64encode(bytes(range(4))).decode())"`
         // -> "AAECAw==" -> stripped of padding: "AAECAw"
