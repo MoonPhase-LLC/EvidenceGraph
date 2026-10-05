@@ -130,6 +130,10 @@ is calling.
   exposing the endpoint/token to the frontend (D-025). Environment variables cannot provide this
   bidirectional exchange. Any failure (child exit, bind failure, timeout, bad challenge
   response) fails closed — no fallback to whatever else may be listening on a port.
+- Verification covers the peer at startup only, so the host keeps the one HTTP connection over
+  which the challenge was verified and sends every later credential-bearing request over that same
+  connection; it never dials the port again (`DECISIONS.md` D-026). If that connection is lost, the
+  host revokes `Ready`, fails closed, and does not reconnect or resend the token.
 - The model runtime (llama.cpp) has its **own** independent credential, separate from the D-009
   token, held only within the FastAPI process boundary and never exposed to the frontend
   (`DECISIONS.md` D-017, `MODEL_RUNTIME.md` §10) — the FastAPI↔frontend boundary and the
