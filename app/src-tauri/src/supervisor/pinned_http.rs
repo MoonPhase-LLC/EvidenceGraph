@@ -37,6 +37,22 @@
 //! socket is dropped, [`PinnedConnection::is_alive`] goes false, and
 //! every later call fails without I/O. Nothing redials.
 //!
+//! **Revocation** (S1-04 review round 4): [`PinnedConnection::revoke`] is
+//! the one way to end this connection deliberately -- used by the
+//! supervisor when it records shutdown or otherwise revokes `Ready`, and
+//! by `send` itself when an exchange fails after it started. It closes a
+//! gate built into the socket wrapper ([`GatedStream`]): every read and
+//! write first takes a read lock on the gate and fails without touching
+//! the socket if it is closed, and `revoke` closes it under the write
+//! lock. So once `revoke` returns, this process performs no further I/O
+//! on the socket -- not for a request queued behind another, not for one
+//! that already passed every earlier check, not for a stale clone. This
+//! is enforced at the socket, not by a flag a sender checks before
+//! writing, so there is no check-then-send window: a request that wrote
+//! some bytes before revocation (to the verified peer, the only peer this
+//! socket has) fails at its next read or write. `revoke` also wakes the
+//! driver task, which drops the socket.
+//!
 //! Deliberately **not** using `reqwest` here: even with connection pooling
 //! disabled, `reqwest::Client::get(...).send()` still dials a fresh
 //! connection per call by design -- there is no `reqwest` API for "reuse
@@ -50,8 +66,12 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::sync::Arc;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{timeout, timeout_at, Instant};
@@ -110,6 +130,91 @@ impl std::fmt::Display for PinnedSendError {
     }
 }
 
+/// The revocation gate shared by a [`PinnedConnection`] and its socket.
+/// `closed` is only ever set, never cleared.
+#[derive(Default)]
+struct Gate {
+    closed: RwLock<bool>,
+}
+
+impl Gate {
+    fn close(&self) {
+        // Waits for any read/write currently inside the gate (a single
+        // non-blocking socket poll) to finish, so none starts afterwards.
+        *self.closed.write().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        *self.closed.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs one socket poll while holding the gate open, or fails without
+    /// touching the socket if it is closed.
+    fn with_open<T>(&self, poll: impl FnOnce() -> Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        let closed = self.closed.read().unwrap_or_else(PoisonError::into_inner);
+        if *closed {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()));
+        }
+        poll()
+    }
+}
+
+/// The TCP stream with every read and write routed through the [`Gate`].
+/// Shutting down the write side is left ungated: it sends no request data.
+struct GatedStream {
+    inner: TcpStream,
+    gate: Arc<Gate>,
+}
+
+impl AsyncRead for GatedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        this.gate.with_open(|| Pin::new(inner).poll_read(cx, buf))
+    }
+}
+
+impl AsyncWrite for GatedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        this.gate.with_open(|| Pin::new(inner).poll_write(cx, buf))
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        this.gate
+            .with_open(|| Pin::new(inner).poll_write_vectored(cx, bufs))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        this.gate.with_open(|| Pin::new(inner).poll_flush(cx))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// A single, explicitly owned HTTP/1.1 connection to the verified child.
 /// Cheap to clone -- every clone shares the same underlying connection
 /// (requests are serialized through a `Mutex`, which is not a throughput
@@ -120,9 +225,16 @@ impl std::fmt::Display for PinnedSendError {
 pub struct PinnedConnection {
     sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
     alive: watch::Receiver<bool>,
-    /// Cancelled to tear the connection down deliberately (fail closed)
-    /// -- see module docs. The driver task drops the socket when it fires.
+    /// Closed by [`revoke`](Self::revoke); checked inside every socket
+    /// read/write -- see module docs.
+    gate: Arc<Gate>,
+    /// Cancelled by `revoke` (after closing the gate) to wake the driver
+    /// task, which then drops the socket.
     abort: CancellationToken,
+    /// Test-only: fires when a `send` is about to wait for the sender, so
+    /// tests can establish "queued behind another request" explicitly.
+    #[cfg(test)]
+    queued_probe: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// A fully read response: status plus the complete, size-bounded body.
@@ -150,7 +262,11 @@ impl PinnedConnection {
             .await
             .map_err(|_| PinnedConnectError::ConnectTimedOut)?
             .map_err(|_| PinnedConnectError::Connect)?;
-        let io = TokioIo::new(stream);
+        let gate = Arc::new(Gate::default());
+        let io = TokioIo::new(GatedStream {
+            inner: stream,
+            gate: gate.clone(),
+        });
 
         let (sender, conn) = http1::Builder::new()
             .handshake::<_, Full<Bytes>>(io)
@@ -179,8 +295,28 @@ impl PinnedConnection {
         Ok(Self {
             sender: Arc::new(Mutex::new(sender)),
             alive: alive_rx,
+            gate,
             abort,
+            #[cfg(test)]
+            queued_probe: Arc::default(),
         })
+    }
+
+    /// Permanently ends this connection for every clone: once this
+    /// returns, no further byte is read from or written to the socket by
+    /// this process (see module docs). Idempotent.
+    pub fn revoke(&self) {
+        self.gate.close();
+        self.abort.cancel();
+    }
+
+    /// Test-only: the returned receiver resolves when the next `send` on
+    /// any clone is about to wait for the sender.
+    #[cfg(test)]
+    pub(super) fn notify_when_next_send_queues(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.queued_probe.lock().unwrap() = Some(tx);
+        rx
     }
 
     /// A cheap, immediate check -- does not itself perform any I/O. Used
@@ -191,7 +327,7 @@ impl PinnedConnection {
     /// never target anything other than this exact already-established
     /// socket.
     pub fn is_alive(&self) -> bool {
-        !self.abort.is_cancelled() && *self.alive.borrow()
+        !self.gate.is_closed() && *self.alive.borrow()
     }
 
     /// Resolves once this connection is observed closed -- lets a caller
@@ -262,14 +398,23 @@ impl PinnedConnection {
         // deadline. Timing out here drops only the pending lock
         // acquisition (cancel-safe) -- nothing was written, so the
         // connection is untouched and stays usable by its current owner.
+        #[cfg(test)]
+        if let Some(probe) = self.queued_probe.lock().unwrap().take() {
+            // Sent in the same poll that then parks on the lock, so a
+            // current-thread test runtime cannot observe it before this
+            // call is actually waiting.
+            let _ = probe.send(());
+        }
         let Ok(mut sender) = timeout_at(deadline, self.sender.lock()).await else {
             return Err(PinnedSendError::TimedOut);
         };
 
-        // A previous owner may have aborted the connection while this
-        // call was queued; the driver task may not have dropped the
-        // socket yet, so check the abort itself rather than the flag.
-        if check_abort && self.abort.is_cancelled() {
+        // Fast path: the connection was revoked while this call was
+        // queued (by a failed previous owner, or by the supervisor). Not
+        // what prevents I/O after revocation -- the gate in the socket
+        // does that, even when this is skipped -- just a clean "never
+        // tried" result.
+        if check_abort && self.gate.is_closed() {
             return Err(PinnedSendError::AlreadyClosed);
         }
 
@@ -293,7 +438,7 @@ impl PinnedConnection {
             // Fail closed while still holding the sender, so no queued
             // call can start an exchange on a connection whose request/
             // response state is now unknown.
-            self.abort.cancel();
+            self.revoke();
         }
         drop(sender);
         result
@@ -1148,6 +1293,87 @@ Content-Length: 1000
         assert!(
             server.arrivals.try_recv().is_err(),
             "the queued request must never reach the wire"
+        );
+        assert_eq!(server.accepted(), 1, "no redial");
+    }
+
+    // --- S1-04 review round 4: revocation reaches the transport ----------
+
+    #[tokio::test]
+    async fn revoke_stops_a_queued_call_even_with_every_check_bypassed() {
+        // One call in flight (the server holds it), a second queued behind
+        // it using the test-only path that skips both the liveness fast
+        // path and the post-acquisition revoked check. `revoke` alone must
+        // stop the queued call from writing anything, and fail the
+        // in-flight one.
+        let mut server = SlowServer::start(Duration::from_secs(5)).await;
+        let conn = PinnedConnection::connect("127.0.0.1", server.port, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        let owner = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                conn.send(
+                    get_request("127.0.0.1", port, "/health"),
+                    BODY,
+                    Duration::from_secs(3),
+                )
+                .await
+            })
+        };
+        server.arrivals.recv().await.unwrap();
+
+        let queued_signal = conn.notify_when_next_send_queues();
+        let queued = {
+            let conn = conn.clone();
+            let port = server.port;
+            tokio::spawn(async move {
+                conn.send_ignoring_liveness_flag(
+                    get_request("127.0.0.1", port, "/health"),
+                    BODY,
+                    Duration::from_secs(3),
+                )
+                .await
+            })
+        };
+        queued_signal.await.unwrap();
+
+        conn.revoke();
+        assert!(!conn.is_alive());
+
+        let owner = tokio::time::timeout(Duration::from_secs(2), owner)
+            .await
+            .expect("the in-flight call fails promptly")
+            .unwrap();
+        assert!(owner.is_err(), "in-flight call must fail after revoke");
+        let queued = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("the queued call fails promptly")
+            .unwrap();
+        assert!(queued.is_err(), "queued call must fail after revoke");
+
+        // Later calls on any clone fail without I/O.
+        assert_eq!(
+            conn.clone()
+                .send(
+                    get_request("127.0.0.1", server.port, "/health"),
+                    BODY,
+                    Duration::from_secs(1),
+                )
+                .await
+                .err(),
+            Some(PinnedSendError::AlreadyClosed)
+        );
+        tokio::time::timeout(Duration::from_secs(2), conn.closed())
+            .await
+            .expect("revoked connection is observed closed");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            server.arrivals.try_recv().is_err(),
+            "no request after the first may reach the wire"
         );
         assert_eq!(server.accepted(), 1, "no redial");
     }

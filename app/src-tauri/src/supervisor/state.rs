@@ -36,6 +36,17 @@
 //! set_ready`] checks that record in the same locked step that would
 //! publish. The two are serialized by the lock, so once shutdown is
 //! recorded no `Ready` state or usable connection can appear.
+//!
+//! **S1-04 review round 4** (revocation must reach the transport):
+//! revoking a published connection -- on shutdown, child exit, or
+//! connection loss -- also calls [`PinnedConnection::revoke`] in that
+//! same locked step. Clearing the handle and flipping the liveness signal
+//! only stop *new* lookups and *future* liveness checks; a request that
+//! had already passed its liveness check and was queued for the
+//! connection would otherwise still send its credential once the
+//! connection freed up. Transport revocation closes the socket's gate,
+//! so after `begin_shutdown` returns no request -- queued, in flight, or
+//! from a stale clone -- moves another byte over that socket.
 
 use super::pinned_http::PinnedConnection;
 use serde::Serialize;
@@ -117,7 +128,9 @@ impl Inner {
     /// Clears the published connection and marks every existing clone of
     /// it dead. Caller holds the write lock.
     fn revoke_connection(&mut self) {
-        self.connection = None;
+        if let Some(connection) = self.connection.take() {
+            connection.pinned.revoke();
+        }
         if let Some(alive) = self.connection_alive.take() {
             let _ = alive.send(false);
         }
@@ -173,23 +186,33 @@ impl SupervisorHandle {
         true
     }
 
-    /// Records a shutdown request and revokes any published connection,
-    /// in one locked step (see module docs), then hands the cancellation
-    /// token and lifecycle task to exactly one caller. Every later (or
-    /// concurrent) caller observes `None`. Records the request even when
-    /// nothing is armed yet.
+    /// Records a shutdown request, cancels the lifecycle, and revokes any
+    /// published connection down to its transport, in one locked step
+    /// (see module docs), then hands the (already cancelled) token and the
+    /// lifecycle task to exactly one caller. Every later (or concurrent)
+    /// caller observes `None`. Records the request even when nothing is
+    /// armed yet.
     pub(super) async fn begin_shutdown(
         &self,
     ) -> Option<(CancellationToken, tauri::async_runtime::JoinHandle<()>)> {
         let mut inner = self.inner.write().await;
         inner.shutdown_requested = true;
+        let taken = inner.cancellation_token.take().map(|token| {
+            let task = inner
+                .lifecycle_task
+                .take()
+                .expect("arm_and_spawn registers the token and task together");
+            (token, task)
+        });
+        // Cancel *before* revoking the transport: the lifecycle task races
+        // the token against the connection closing (`biased` towards the
+        // token), so a close caused by this revocation is always handled
+        // as the graceful shutdown it is, never as a lost connection.
+        if let Some((token, _)) = &taken {
+            token.cancel();
+        }
         inner.revoke_connection();
-        let token = inner.cancellation_token.take()?;
-        let task = inner
-            .lifecycle_task
-            .take()
-            .expect("arm_and_spawn registers the token and task together");
-        Some((token, task))
+        taken
     }
 
     pub async fn set_state(&self, state: SupervisorState) {
@@ -211,6 +234,7 @@ impl SupervisorHandle {
     ) -> bool {
         let mut inner = self.inner.write().await;
         if inner.shutdown_requested {
+            connection.pinned.revoke();
             let _ = alive.send(false);
             return false;
         }
@@ -456,6 +480,7 @@ mod tests {
         assert_ne!(handle.snapshot().await, SupervisorState::Ready);
         assert!(handle.ready_connection().await.is_none());
         assert!(!probe.is_alive(), "a refused connection must be dead");
+        assert!(!probe.pinned.is_alive(), "its transport must be revoked");
     }
 
     #[tokio::test]
@@ -470,6 +495,7 @@ mod tests {
 
         assert!(handle.ready_connection().await.is_none());
         assert!(!held.is_alive());
+        assert!(!held.pinned.is_alive(), "the transport itself is revoked");
     }
 
     #[tokio::test]

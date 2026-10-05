@@ -320,6 +320,17 @@ async fn watch_ready_process_inner(
     }
 
     tokio::select! {
+        // `biased`, cancellation first: `begin_shutdown` cancels the token
+        // before it revokes the transport, so when shutdown is what closed
+        // the connection, this branch is always the one taken.
+        biased;
+        () = token.cancelled() => {
+            // `begin_shutdown` already revoked the connection, down to its
+            // transport, when it recorded the request; this is the
+            // process-side cleanup.
+            stop_child(&mut child, &mut stdin, &mut stdout).await;
+            handle.mark_stopped().await;
+        }
         status = child.wait() => {
             debug_log("child exited unexpectedly", &status.map(|s| s.to_string()).unwrap_or_default());
             // "Stop accepting frontend access immediately":
@@ -336,12 +347,6 @@ async fn watch_ready_process_inner(
             // reactively the next time something tries to use it.
             debug_log("pinned connection to child lost", &"");
             handle.invalidate_ready(FailureReason::AuthenticatedConnectionLost.as_str()).await;
-        }
-        () = token.cancelled() => {
-            // `begin_shutdown` already revoked the connection when it
-            // recorded the request; this is the process-side cleanup.
-            stop_child(&mut child, &mut stdin, &mut stdout).await;
-            handle.mark_stopped().await;
         }
     }
 
@@ -1281,10 +1286,11 @@ mod tests {
         let connection = handle.ready_connection().await.unwrap();
         assert!(connection.is_alive());
 
-        // Record shutdown without yet cancelling the lifecycle task: the
-        // child is still running and the pinned socket still open, yet
-        // nothing may use the connection any more.
+        // Record shutdown directly (the first half of `shutdown`) and check
+        // the revocation the moment it returns, before the lifecycle task
+        // has stopped the child.
         let (cancel, join) = handle.begin_shutdown().await.unwrap();
+        assert!(!connection.pinned.is_alive(), "the transport is revoked");
         assert!(handle.ready_connection().await.is_none());
         assert!(!connection.is_alive());
         assert_eq!(
@@ -1298,6 +1304,257 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(handle.snapshot().await, SupervisorState::Stopped);
+    }
+
+    // --- S1-04 review round 4: shutdown revokes the transport -----------
+
+    /// Stands in for the verified peer of the pinned connection, so a
+    /// request can be *held* on it. Accepts connections (counting them),
+    /// holds the first request until released, and records every byte
+    /// received after that first request -- answering any further
+    /// complete request, so that if a second request ever were sent, the
+    /// exchange would complete and the bytes would be observable.
+    struct HeldPeer {
+        port: u16,
+        first_request_received: tokio::sync::oneshot::Receiver<()>,
+        release_first: Option<tokio::sync::oneshot::Sender<()>>,
+        after_first: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HeldPeer {
+        async fn start() -> Self {
+            const HEALTH: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 67\r\n\r\n{\"status\":\"ok\",\"service\":\"evidencegraph-service\",\"version\":\"0.1.0\"}";
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (received_tx, first_request_received) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let after_first = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (after, count) = (after_first.clone(), accepted.clone());
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Any later connection attempt would also be counted.
+                tokio::spawn(async move {
+                    while listener.accept().await.is_ok() {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                let mut pending = Vec::new();
+                let mut buf = vec![0u8; 4096];
+                while !pending.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "connection closed before the first request");
+                    pending.extend_from_slice(&buf[..n]);
+                }
+                let end = pending.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                after.lock().unwrap().extend_from_slice(&pending[end..]);
+                let _ = received_tx.send(());
+                let _ = release_rx.await;
+                let _ = socket.write_all(HEALTH.as_bytes()).await;
+                let mut answered = 0;
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let complete = {
+                                let mut after = after.lock().unwrap();
+                                after.extend_from_slice(&buf[..n]);
+                                after.windows(4).filter(|w| *w == b"\r\n\r\n").count()
+                            };
+                            for _ in answered..complete {
+                                let _ = socket.write_all(HEALTH.as_bytes()).await;
+                            }
+                            answered = complete;
+                        }
+                    }
+                }
+            });
+            Self {
+                port,
+                first_request_received,
+                release_first: Some(release_tx),
+                after_first,
+                accepted,
+            }
+        }
+
+        fn bytes_after_first(&self) -> Vec<u8> {
+            self.after_first.lock().unwrap().clone()
+        }
+    }
+
+    /// The review's sequence, forced with explicit synchronization (no
+    /// sleeps decide ordering), through production `shutdown` and the
+    /// production lifecycle (`watch_ready_process`) with a real child:
+    ///
+    /// 1. request A owns the connection (the peer has received it and holds it);
+    /// 2. request B passes its liveness check, then queues behind A;
+    /// 3. production `shutdown` records revocation;
+    /// 4. A is released;
+    /// 5. B must send nothing -- no request bytes, no credential.
+    ///
+    /// The real child is started and verified as usual; only the published
+    /// transport is a connection to `HeldPeer`, because the real service
+    /// answers `/health` immediately and so cannot hold request A.
+    #[tokio::test]
+    async fn shutdown_while_a_request_is_queued_sends_nothing_from_it() {
+        let (executable, args) = real_dev_target();
+        let handle = SupervisorHandle::new();
+        let mut handshake = run_startup_with_executable(&handle, &executable, &args)
+            .await
+            .expect("startup should succeed");
+        let pid = handshake
+            .process
+            .child
+            .id()
+            .expect("child should have a pid");
+        let mut peer = HeldPeer::start().await;
+        handshake.pinned = PinnedConnection::connect("127.0.0.1", peer.port, HTTP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let (handle_for_task, token_for_task) = (handle.clone(), token.clone());
+        assert!(
+            handle
+                .arm_and_spawn(token.clone(), move || {
+                    tauri::async_runtime::spawn(watch_ready_process(
+                        handle_for_task,
+                        handshake,
+                        token_for_task,
+                    ))
+                })
+                .await
+        );
+        assert!(
+            poll_state(
+                &handle,
+                |s| *s == SupervisorState::Ready,
+                Duration::from_secs(5)
+            )
+            .await
+        );
+        let connection = handle.ready_connection().await.unwrap();
+
+        // Step 1: A is on the wire and owns the sender.
+        let request_a = {
+            let connection = connection.clone();
+            tokio::spawn(async move { check_service_health(&connection).await })
+        };
+        (&mut peer.first_request_received)
+            .await
+            .expect("request A must reach the peer");
+
+        // Step 2: B passes its initial liveness check (signalled by the
+        // hook), then is resumed and parks waiting for the sender
+        // (signalled by the transport's queue probe).
+        let queued = connection.pinned.notify_when_next_send_queues();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let request_b = {
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                check_service_health_inner(
+                    &connection,
+                    PostLivenessHook::pause(reached_tx, resume_rx, false),
+                )
+                .await
+            })
+        };
+        reached_rx.await.expect("B must pass its liveness check");
+        let _ = resume_tx.send(());
+        queued.await.expect("B must queue behind A");
+        assert!(connection.is_alive(), "B queued on a live connection");
+
+        // Step 3: production shutdown records revocation. It cancels the
+        // token inside the same locked step that revokes; taking the
+        // handle's lock afterwards proves that step has finished.
+        let shutdown_task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { shutdown(&handle).await })
+        };
+        token.cancelled().await;
+        let _ = handle.snapshot().await;
+        assert!(handle.ready_connection().await.is_none());
+        assert!(!connection.is_alive());
+
+        // Step 4: release A.
+        let _ = peer.release_first.take().unwrap().send(());
+
+        // Step 5: B sends nothing.
+        let b = timeout(Duration::from_secs(5), request_b)
+            .await
+            .expect("B must finish promptly")
+            .unwrap();
+        assert!(b.is_err(), "B must fail, got {b:?}");
+        let a = timeout(Duration::from_secs(5), request_a)
+            .await
+            .expect("A must finish promptly")
+            .unwrap();
+        assert!(
+            a.is_err(),
+            "A was in flight when the transport was revoked, got {a:?}"
+        );
+        // B has finished. Had it sent its request, the peer would already
+        // have recorded it (the peer reads a request before answering).
+        let after_b = peer.bytes_after_first();
+        assert!(
+            after_b.is_empty(),
+            "B sent {} bytes after shutdown was recorded (credential included: {}): {:?}",
+            after_b.len(),
+            String::from_utf8_lossy(&after_b).contains(&connection.token),
+            String::from_utf8_lossy(&after_b)
+        );
+
+        // Stale handles reject later calls -- including one that skips
+        // every liveness check and goes straight to the transport.
+        assert_eq!(
+            check_service_health(&connection).await.unwrap_err(),
+            HealthCheckError::ServiceNoLongerAlive
+        );
+        let stale = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("Host", format!("127.0.0.1:{}", peer.port))
+            .header("Authorization", format!("Bearer {}", connection.token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(connection
+            .pinned
+            .send_ignoring_liveness_flag(stale, MAX_HTTP_RESPONSE_BYTES, HTTP_REQUEST_TIMEOUT)
+            .await
+            .is_err());
+
+        // Cleanup completes: graceful stop, child gone, nothing exposed.
+        timeout(Duration::from_secs(15), shutdown_task)
+            .await
+            .expect("shutdown must finish")
+            .unwrap();
+        assert_eq!(handle.snapshot().await, SupervisorState::Stopped);
+        assert!(handle.ready_connection().await.is_none());
+        assert!(!process_is_running(pid));
+
+        // Give any (incorrectly) written bytes time to arrive, then check
+        // that nothing at all was received after request A.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = peer.bytes_after_first();
+        assert!(
+            after.is_empty(),
+            "the peer received {} bytes after request A: {:?}",
+            after.len(),
+            String::from_utf8_lossy(&after)
+        );
+        assert!(!String::from_utf8_lossy(&after).contains(&connection.token));
+        assert_eq!(
+            peer.accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no redial"
+        );
+        // Structural cause of the above: shutdown revoked the transport
+        // itself, not only the handle and the liveness signal.
+        assert!(!connection.pinned.is_alive(), "the transport is revoked");
     }
 
     fn process_is_running(pid: u32) -> bool {

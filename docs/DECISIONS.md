@@ -908,6 +908,16 @@ establish this; a check followed by an independent dial cannot close the race.
   A call that fails after acquiring the mutex (deadline, oversized or unreadable body, transport
   error) aborts the connection before releasing the mutex, because the HTTP/1.1 exchange is then in
   an unknown state. That is a connection loss, handled as above.
+- Revocation reaches the transport (S1-04 review round 4). Every read and write on the pinned socket
+  passes through a gate, and `PinnedConnection::revoke` closes it. Once `revoke` returns, this
+  process performs no further I/O on that socket, whether the request was queued, already past its
+  liveness checks, or made through a stale copy of the connection. Whenever the supervisor revokes
+  `Ready` (shutdown, child exit, connection loss), it calls `revoke` in the same locked step that
+  clears the published connection. Clearing the handle and the liveness flag alone did not stop a
+  request that had already passed its liveness check and was queued for the connection: it still
+  sent its bearer token after shutdown. That was safe only because the peer was the verified child,
+  and it was not acceptable. A request already writing or reading when `revoke` runs fails at its
+  next socket operation. Bytes it wrote before then went only to the verified peer.
 
 **Limitations (accepted, not hidden):**
 - After 7 days of *complete* idleness the server would close the connection and the app fails closed
