@@ -129,7 +129,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
         with:
           enable-cache: true
           cache-dependency-glob: service/uv.lock
@@ -178,7 +178,7 @@ jobs:
           npm ci
           npm run build
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
         with:
           enable-cache: true
           cache-dependency-glob: service/uv.lock
@@ -233,7 +233,7 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
         with:
           enable-cache: true
           cache-dependency-glob: service/uv.lock
