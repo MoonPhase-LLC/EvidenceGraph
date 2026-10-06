@@ -77,8 +77,14 @@ uv run python -m evidencegraph_service
 ## Tests, lint, and types
 
 ```sh
-uv run pytest
+uv sync --frozen   # install exactly the locked dependencies, including the dev group
+uv run pytest      # the full service test suite (tests/), exits non-zero on any failure
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
 ```
+
+`pytest` is configured in `pyproject.toml` (`[tool.pytest.ini_options]`).
+- `tests/test_health.py` and `tests/test_auth.py` cover the S1-03 `/health` endpoint and session-token authentication in process.
+- `test_server_process.py`, `test_supervised_process.py` and `test_supervised_app.py` start the real service as a child process, bound to `127.0.0.1`.
+- These tests exercise the Python service on its own. Tauri's supervision of the service is tested on the Rust side (`cargo test` in `app/src-tauri/`) and by the native smoke test in `app/` (see `app/README.md`).

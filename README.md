@@ -19,10 +19,12 @@ planning documentation only. Sprint 1 is in progress. What exists so far:
   credential.
 - **S1-05:** the frontend has a basic desktop layout. It has navigation placeholders that are not
   usable yet, and it shows the local service's status and health result.
+- **S1-06:** test runners. Vitest for the frontend, the existing pytest suite for the service, a
+  Playwright browser smoke test, and an opt-in Windows native smoke test (see `app/README.md`).
 
 There is still no evidence handling, database, model runtime, or working assessment feature.
-Remaining Sprint 1 work: test runner setup (S1-06), CI (S1-07), Sprint 1 exit validation (S1-08)
-and the packaged-build spike (S1-09).
+Remaining Sprint 1 work: CI (S1-07), Sprint 1 exit validation (S1-08) and the packaged-build
+spike (S1-09).
 See `docs/SPRINT_1_BACKLOG.md` for ticket details, `docs/SPRINTS.md` for the full sprint plan,
 and `docs/OPEN_QUESTIONS.md` for decisions still pending product-owner input.
 

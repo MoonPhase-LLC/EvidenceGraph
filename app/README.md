@@ -87,7 +87,41 @@ Rules that apply to every screen:
   do not put tracked code in `src/lib/`. The shadcn `cn` helper comes from
   the `cn` package.
 
-There is no frontend test runner yet; that is S1-06.
+## Tests (S1-06)
+
+Prerequisite: `npm ci` (from the committed lockfile). The Playwright
+browser runs also need Chromium for Playwright, installed once per machine
+with `npx playwright install chromium`.
+
+| Command | Runner | What it covers |
+|---|---|---|
+| `npm test` | Vitest (jsdom + Testing Library) | `src/**/*.test.ts(x)`: the `useLocalService` hook and the app shell, with Tauri IPC mocked |
+| `npm run test:e2e` | Playwright, Chromium | Browser smoke test: the real frontend served by the Vite dev server, with IPC mocked |
+| `npm run test:e2e:native` | Playwright over WebView2 (Windows only, opt-in) | Native smoke test: the real debug Tauri app, with real supervision and the real service |
+
+Each command exits non-zero when a test fails.
+
+**Unit and component tests (`npm test`).**
+- Tests live next to the code (`*.test.tsx`). `tsc` type-checks them as part of `npm run build`, but the Vite build never bundles them.
+- The IPC boundary is replaced with Tauri's official `mockIPC` (`src/test/serviceIpc.ts`), so the real `invoke` path runs.
+- Async ordering is controlled with fake timers and explicit deferred promises, never sleeps. Hook tests read the hook's returned state directly, because the UI hides health outside `ready` and would mask a stale write.
+- `src/test/setup.ts` unmounts, clears the IPC mock and restores real timers after every test. It also provides a minimal `jest` timer shim that Testing Library needs under Vitest's fake timers.
+- These are DOM tests. They don't prove what a screen reader speaks, or rendered colors and contrast.
+
+**Browser smoke test (`npm run test:e2e`).**
+- `e2e/smoke.html` and `e2e/smoke-entry.ts` install `mockIPC` and then load the app's real entry point, `src/main.tsx`. They are test-only files: the production build never references them, and there is no production mock mode.
+- Playwright starts its own Vite dev server, bound to `localhost:1420` with the normal development CSP, and stops it afterwards. It never reuses an existing server, so the run fails if `npm run tauri dev` is already using port 1420.
+- The test checks the shell, navigation, the mocked ready and health state, a failure transition, and that the page logs no errors (including CSP violations).
+- **It does not launch Tauri, the Python service, or process supervision.**
+
+**Native smoke test (`npm run test:e2e:native`).**
+- Prerequisites: run `uv sync` in `service/`, build the debug app with `npm run tauri build -- --debug --no-bundle`, and close any running instance of that debug app.
+- It launches `src-tauri/target/debug/app.exe` and attaches Playwright to its WebView2 through a DevTools port on `127.0.0.1`. That port is enabled only for the test process, through `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`; the app itself is unchanged.
+- It checks real authenticated health, a service crash revoking readiness, and that a graceful close (WM_CLOSE) exits cleanly with the service processes gone.
+- It is skipped (with a reason) on non-Windows platforms. It covers the debug build only, not an installed package (that is S1-09).
+
+The Rust supervisor tests run with `cargo test` in `src-tauri/`, and the
+Python service tests with `uv run pytest` in `../service/`.
 
 ## Recommended IDE Setup
 
