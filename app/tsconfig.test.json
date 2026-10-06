@@ -1,0 +1,21 @@
+{
+  // Type-checks all test code, including the Playwright specs and the tool
+  // configs that `tsconfig.json` (src/ only) does not reach. Run with
+  // `npm run typecheck:test`. Same strict options as the app.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/test",
+    "src/vite-env.d.ts",
+    "e2e",
+    "e2e-native",
+    "playwright.config.ts",
+    "playwright.native.config.ts",
+    "vitest.config.ts",
+    "vite.config.ts"
+  ]
+}

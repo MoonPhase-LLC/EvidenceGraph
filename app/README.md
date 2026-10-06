@@ -95,6 +95,8 @@ with `npx playwright install chromium`.
 
 | Command | Runner | What it covers |
 |---|---|---|
+| `npm run lint` | ESLint (`eslint.config.js`) | Minimal rules: ESLint and typescript-eslint recommended, plus the two classic React hook rules; no style rules. shadcn primitives in `src/components/ui/` are not linted |
+| `npm run typecheck:test` | `tsc -p tsconfig.test.json` | Strict typecheck of all test code, including the Playwright specs and the Vite/Vitest/Playwright configs, which `npm run build` does not cover |
 | `npm test` | Vitest (jsdom + Testing Library) | `src/**/*.test.ts(x)`: the `useLocalService` hook and the app shell, with Tauri IPC mocked |
 | `npm run test:e2e` | Playwright, Chromium | Browser smoke test: the real frontend served by the Vite dev server, with IPC mocked |
 | `npm run test:e2e:native` | Playwright over WebView2 (Windows only, opt-in) | Native smoke test: the real debug Tauri app, with real supervision and the real service |

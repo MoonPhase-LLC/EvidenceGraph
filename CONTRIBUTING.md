@@ -184,6 +184,8 @@ Frontend tests (S1-06), from `app/`, after `npm ci`. See `app/README.md` for the
 each runner:
 
 ```sh
+npm run lint                # ESLint (minimal config: eslint.config.js)
+npm run typecheck:test      # strict typecheck of test code, Playwright specs and configs
 npm test                    # Vitest unit/component tests (jsdom, Tauri IPC mocked)
 npx playwright install chromium   # once per machine, before the first browser run
 npm run test:e2e            # Playwright browser smoke test (Vite dev server, IPC mocked; no Tauri)
