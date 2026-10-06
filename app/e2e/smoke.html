@@ -1,0 +1,17 @@
+<!doctype html>
+<!--
+  Test-only page for the Playwright browser smoke test (S1-06). Served by the
+  normal Vite dev server, under its normal development CSP. It is not part of
+  the production build: `vite build` only bundles `index.html`.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EvidenceGraph (browser smoke test)</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/e2e/smoke-entry.ts"></script>
+  </body>
+</html>

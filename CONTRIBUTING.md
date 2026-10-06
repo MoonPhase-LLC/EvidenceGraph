@@ -180,7 +180,15 @@ uv run ruff format --check .  # format check
 uv run mypy               # type check
 ```
 
-No frontend test runner is configured yet (Vitest/Playwright) — that is S1-06's scope, not
-S1-02's or S1-03's. There is no rendering smoke test in `app/` for the same reason. `service/`'s
-own `pytest` suite (above) is this ticket's (S1-03's) required test coverage, not a placeholder
-awaiting S1-06 — S1-06 is expected to integrate it into cross-project tooling/CI, not create it.
+Frontend tests (S1-06), from `app/`, after `npm ci`. See `app/README.md` for the boundaries of
+each runner:
+
+```sh
+npm test                    # Vitest unit/component tests (jsdom, Tauri IPC mocked)
+npx playwright install chromium   # once per machine, before the first browser run
+npm run test:e2e            # Playwright browser smoke test (Vite dev server, IPC mocked; no Tauri)
+npm run test:e2e:native     # opt-in, Windows: real debug Tauri app + real service via WebView2
+```
+
+The native smoke test needs `uv sync` in `service/` and `npm run tauri build -- --debug
+--no-bundle` first. No CI runs any of these yet (S1-07).
