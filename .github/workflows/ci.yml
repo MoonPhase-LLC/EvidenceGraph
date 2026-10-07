@@ -208,7 +208,7 @@ jobs:
 
       - name: Add rustfmt and Clippy to the pinned toolchain
         working-directory: app/src-tauri
-        run: rustup component add rustfmt clippy no-such-component-s1-07 # DELIBERATE FAILURE (S1-07 propagation check), reverted next commit
+        run: rustup component add rustfmt clippy
 
       - name: Show the Rust toolchain
         working-directory: app/src-tauri
