@@ -57,6 +57,24 @@ function servicePids(rootPid: number): number[] {
   return out ? out.split(",").map(Number) : [];
 }
 
+/** Diagnostics only: each msedgewebview2 descendant of `rootPid` with its (truncated) command line. */
+function webviewProcesses(rootPid: number): string {
+  try {
+    return listWebviewProcesses(rootPid);
+  } catch (err) {
+    return `(could not list: ${err instanceof Error ? err.message : String(err)})`;
+  }
+}
+
+function listWebviewProcesses(rootPid: number): string {
+  return powershell(
+    `$all = Get-CimInstance Win32_Process; $ids = @(${rootPid}); $found = @();
+     do { $next = @($all | Where-Object { $ids -contains $_.ParentProcessId }); $ids = @($next | ForEach-Object ProcessId);
+          $found += @($next | Where-Object { $_.Name -eq 'msedgewebview2.exe' }) } while ($next.Count -gt 0);
+     if ($found.Count -eq 0) { '(none)' } else { $found | ForEach-Object { "$($_.ProcessId): $($_.CommandLine.Substring(0, [Math]::Min(600, $_.CommandLine.Length)))" } }`,
+  ).trim();
+}
+
 function alive(pids: number[]): number[] {
   if (pids.length === 0) return [];
   const out = powershell(`@(Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue | ForEach-Object Id) -join ','`).trim();
@@ -91,7 +109,8 @@ async function launch(): Promise<Launched> {
         throw new Error(
           `WebView2 DevTools port ${port} never opened; ${state}.\n` +
             `last connect error: ${err instanceof Error ? err.message : String(err)}\n` +
-            `app stderr tail:\n${stderrTail}`,
+            `app stderr tail:\n${stderrTail}\n` +
+            `WebView2 processes under app.exe:\n${webviewProcesses(app.pid!)}`,
         );
       }
       await new Promise((r) => setTimeout(r, 250));

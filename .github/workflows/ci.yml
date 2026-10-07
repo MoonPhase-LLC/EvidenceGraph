@@ -257,6 +257,11 @@ jobs:
         run: |
           $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
           if (Test-Path $key) { "WebView2 runtime: $((Get-ItemProperty $key).pv)" } else { "WebView2 runtime registry key not found" }
+          # Edge/WebView2 policies (e.g. disabled DevTools) would block the
+          # native smoke test's DevTools attachment.
+          foreach ($p in 'HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2', 'HKCU:\SOFTWARE\Policies\Microsoft\Edge') {
+            if (Test-Path $p) { "Policy key $p"; Get-ItemProperty $p | Format-List | Out-String } else { "No policy key $p" }
+          }
 
       # Never test a pre-existing binary: delete any cached app.exe, rebuild
       # the frontend and the debug executable from this checkout, and check
