@@ -252,11 +252,27 @@ jobs:
         with:
           workspaces: app/src-tauri -> target
 
+      # The runner image's WebView2 runtime can lag the Evergreen channel that
+      # end users get. Update it with Microsoft's Evergreen standalone
+      # installer so the test runs against the current runtime.
+      - name: Update the WebView2 runtime (Evergreen)
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          "WebView2 runtime before: $((Get-ItemProperty $key -ErrorAction SilentlyContinue).pv)"
+          $installer = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
+          Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2124701' -OutFile $installer
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike '*O=Microsoft Corporation*') { throw "unexpected installer signature: $($sig.Status) $($sig.SignerCertificate.Subject)" }
+          $proc = Start-Process $installer -ArgumentList '/silent', '/install' -Wait -PassThru
+          "installer exit code: $($proc.ExitCode)"
+
       - name: Show WebView2 runtime
         shell: pwsh
         run: |
           $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
           if (Test-Path $key) { "WebView2 runtime: $((Get-ItemProperty $key).pv)" } else { "WebView2 runtime registry key not found" }
+          Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application' -Directory | ForEach-Object Name
           # Edge/WebView2 policies (e.g. disabled DevTools) would block the
           # native smoke test's DevTools attachment.
           foreach ($p in 'HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2', 'HKCU:\SOFTWARE\Policies\Microsoft\Edge') {
