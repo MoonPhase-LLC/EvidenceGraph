@@ -176,13 +176,18 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
+      # Windows steps use PowerShell, which fails a step only on the LAST
+      # native command's exit code, so each native command gets its own step.
+
       # Tauri's build script embeds `app/dist`, so the frontend is built from
       # this checkout first.
-      - name: Install frontend dependencies (frozen) and build the frontend
+      - name: Install frontend dependencies (frozen)
         working-directory: app
-        run: |
-          npm ci
-          npm run build
+        run: npm ci
+
+      - name: Build the frontend
+        working-directory: app
+        run: npm run build
 
       - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
         with:
@@ -199,10 +204,15 @@ jobs:
       # longer auto-installs it); add the lint components to it.
       - name: Install the pinned Rust toolchain
         working-directory: app/src-tauri
-        run: |
-          rustup toolchain install
-          rustup component add rustfmt clippy
-          rustc --version
+        run: rustup toolchain install
+
+      - name: Add rustfmt and Clippy to the pinned toolchain
+        working-directory: app/src-tauri
+        run: rustup component add rustfmt clippy
+
+      - name: Show the Rust toolchain
+        working-directory: app/src-tauri
+        run: rustc --version
 
       - uses: Swatinem/rust-cache@v2
         with:
