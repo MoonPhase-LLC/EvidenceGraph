@@ -69,7 +69,12 @@ async function launch(): Promise<Launched> {
   const port = await freeLoopbackPort();
   const app = spawn(APP_EXE, [], {
     env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}` },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  // Keep only the tail of the app's stderr, for diagnosing launch failures.
+  let stderrTail = "";
+  app.stderr?.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
   });
   const exited = new Promise<number | null>((resolve) => app.once("exit", (code) => resolve(code)));
 
@@ -79,7 +84,16 @@ async function launch(): Promise<Launched> {
     try {
       browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
     } catch (err) {
-      if (Date.now() > deadline) throw err;
+      if (Date.now() > deadline) {
+        const state = app.exitCode === null && app.signalCode === null
+          ? "app.exe is still running"
+          : `app.exe exited (code ${app.exitCode}, signal ${app.signalCode})`;
+        throw new Error(
+          `WebView2 DevTools port ${port} never opened; ${state}.\n` +
+            `last connect error: ${err instanceof Error ? err.message : String(err)}\n` +
+            `app stderr tail:\n${stderrTail}`,
+        );
+      }
       await new Promise((r) => setTimeout(r, 250));
     }
   }

@@ -157,10 +157,16 @@ class _FakeTauri:
         assert message == {"v": 1, "type": "shutdown_ack"}
 
     def close_stdin(self) -> None:
+        if self.process.stdin is None:
+            return  # already closed
         try:
             self._stdin.close()
         except OSError:
             pass
+        # `Popen.communicate()` flushes any non-None `stdin` before reading. On
+        # POSIX that raises "flush of closed file" for a pipe closed here
+        # (Windows takes a different path), so tell Popen it has no stdin left.
+        self.process.stdin = None
 
     def terminate_and_capture(self) -> None:
         if self.captured:
