@@ -295,6 +295,32 @@ jobs:
           if ($built.LastWriteTime -lt $started) { throw "app.exe was not rebuilt by this job" }
           "Built $($built.FullName) at $($built.LastWriteTime)"
 
+      # TEMPORARY diagnostic (to be removed): which WebView2 argument
+      # mechanisms take effect on the hosted runner.
+      - name: "Diagnostic: WebView2 argument mechanisms"
+        shell: pwsh
+        working-directory: app
+        run: |
+          $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          "elevated (Administrators role active): $admin"
+          function Probe($label, $port) {
+            $p = Start-Process -PassThru 'src-tauri\target\debug\app.exe'
+            Start-Sleep 15
+            $cmd = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -like '*webview-exe-name=app.exe*' -and $_.CommandLine -notlike '*--type=*' } | ForEach-Object CommandLine
+            "[$label] browser has --remote-debugging-port: $([bool]($cmd -match 'remote-debugging-port'))"
+            "[$label] port $port listening: $([bool](Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue))"
+            taskkill.exe /T /F /PID $p.Id | Out-Null
+            Start-Sleep 3
+          }
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9333'
+          Probe 'A: env var, launched from pwsh' 9333
+          Remove-Item Env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+          $key = 'HKCU:\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
+          New-Item $key -Force | Out-Null
+          New-ItemProperty $key -Name 'app.exe' -Value '--remote-debugging-port=9334' -Force | Out-Null
+          Probe 'B: HKCU WebView2 policy' 9334
+          Remove-Item 'HKCU:\Software\Policies\Microsoft\Edge' -Recurse -Force
+
       - name: Native smoke test
         working-directory: app
         run: npm run test:e2e:native
