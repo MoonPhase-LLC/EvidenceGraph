@@ -1,0 +1,231 @@
+# S1-07: Sprint 1 checks on every pull request to main and every push to main.
+#
+# Security posture:
+# - Read-only token (contents: read); no secrets, no write scopes, no deployment.
+# - `pull_request` (not `pull_request_target`), so PR code runs without
+#   access to repository secrets or a write token.
+# - Checkouts do not persist credentials.
+# - Network use is limited to downloading dependencies and the Playwright
+#   browser. No test talks to an AI service or anything evidence-bearing; the
+#   local service under test binds to loopback only.
+#
+# Not run here: the native Windows smoke test (`npm run test:e2e:native`).
+# On hosted windows-latest runners WebView2 ignores the argument overrides the
+# test uses to open its DevTools port, so it cannot attach; see the S1-07
+# status note in docs/SPRINT_1_BACKLOG.md. Run it locally before merging
+# changes to supervision or the native shell.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Supersede in-progress runs for the same PR; never cancel runs on main.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  frontend:
+    name: Frontend (lint, typecheck, build, Vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies (frozen)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck (strict) and build the app
+        run: npm run build
+
+      - name: Typecheck test code (unit tests, Playwright specs, configs)
+        run: npm run typecheck:test
+
+      - name: Vitest
+        run: npm test
+
+  browser-smoke:
+    name: Browser smoke (Playwright, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies (frozen)
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
+
+      - name: Install Chromium and its system dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright browser smoke test
+        run: npm run test:e2e
+
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-smoke-test-results
+          path: app/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  python:
+    name: Service (Python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.11 is the documented minimum (pyproject `requires-python`),
+          # 3.12 the recommended/pinned version (`.python-version`). Windows
+          # is the supported desktop platform.
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.12" }
+    env:
+      # Every uv command in this job uses the matrix interpreter (otherwise
+      # `.python-version` would select 3.12).
+      UV_PYTHON: ${{ matrix.python }}
+    defaults:
+      run:
+        working-directory: service
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
+        with:
+          enable-cache: true
+          cache-dependency-glob: service/uv.lock
+
+      - name: Verify the lockfile matches pyproject.toml
+        run: uv lock --check
+
+      - name: Install dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Show interpreter
+        run: uv run --frozen python --version
+
+      - name: Ruff lint
+        run: uv run --frozen ruff check .
+
+      - name: Ruff format check
+        run: uv run --frozen ruff format --check .
+
+      - name: mypy
+        run: uv run --frozen mypy
+
+      - name: pytest
+        run: uv run --frozen pytest
+
+  rust-windows:
+    name: "Rust supervisor (Windows: fmt, Clippy, tests)"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # Windows steps use PowerShell, which fails a step only on the LAST
+      # native command's exit code, so each native command gets its own step.
+
+      # Tauri's build script embeds `app/dist`, so the frontend is built from
+      # this checkout first.
+      - name: Install frontend dependencies (frozen)
+        working-directory: app
+        run: npm ci
+
+      - name: Build the frontend
+        working-directory: app
+        run: npm run build
+
+      - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
+        with:
+          enable-cache: true
+          cache-dependency-glob: service/uv.lock
+
+      # The supervisor's real-process tests launch service/.venv's Python
+      # (the documented dev-mode service launch).
+      - name: Install the service (frozen)
+        working-directory: service
+        run: uv sync --frozen
+
+      # rust-toolchain.toml pins the toolchain (installed explicitly: rustup no
+      # longer auto-installs it); add the lint components to it.
+      - name: Install the pinned Rust toolchain
+        working-directory: app/src-tauri
+        run: rustup toolchain install
+
+      - name: Add rustfmt and Clippy to the pinned toolchain
+        working-directory: app/src-tauri
+        run: rustup component add rustfmt clippy
+
+      - name: Show the Rust toolchain
+        working-directory: app/src-tauri
+        run: rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+
+      - name: cargo fmt --check
+        working-directory: app/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy (warnings denied)
+        working-directory: app/src-tauri
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test (unit + real-process supervisor tests)
+        working-directory: app/src-tauri
+        run: cargo test --all-targets --all-features

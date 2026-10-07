@@ -57,6 +57,24 @@ function servicePids(rootPid: number): number[] {
   return out ? out.split(",").map(Number) : [];
 }
 
+/** Diagnostics only: each msedgewebview2 descendant of `rootPid` with its (truncated) command line. */
+function webviewProcesses(rootPid: number): string {
+  try {
+    return listWebviewProcesses(rootPid);
+  } catch (err) {
+    return `(could not list: ${err instanceof Error ? err.message : String(err)})`;
+  }
+}
+
+function listWebviewProcesses(rootPid: number): string {
+  return powershell(
+    `$all = Get-CimInstance Win32_Process; $ids = @(${rootPid}); $found = @();
+     do { $next = @($all | Where-Object { $ids -contains $_.ParentProcessId }); $ids = @($next | ForEach-Object ProcessId);
+          $found += @($next | Where-Object { $_.Name -eq 'msedgewebview2.exe' }) } while ($next.Count -gt 0);
+     if ($found.Count -eq 0) { '(none)' } else { $found | ForEach-Object { "$($_.ProcessId): $($_.CommandLine.Substring(0, [Math]::Min(600, $_.CommandLine.Length)))" } }`,
+  ).trim();
+}
+
 function alive(pids: number[]): number[] {
   if (pids.length === 0) return [];
   const out = powershell(`@(Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue | ForEach-Object Id) -join ','`).trim();
@@ -69,7 +87,12 @@ async function launch(): Promise<Launched> {
   const port = await freeLoopbackPort();
   const app = spawn(APP_EXE, [], {
     env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}` },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  // Keep only the tail of the app's stderr, for diagnosing launch failures.
+  let stderrTail = "";
+  app.stderr?.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
   });
   const exited = new Promise<number | null>((resolve) => app.once("exit", (code) => resolve(code)));
 
@@ -79,7 +102,17 @@ async function launch(): Promise<Launched> {
     try {
       browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
     } catch (err) {
-      if (Date.now() > deadline) throw err;
+      if (Date.now() > deadline) {
+        const state = app.exitCode === null && app.signalCode === null
+          ? "app.exe is still running"
+          : `app.exe exited (code ${app.exitCode}, signal ${app.signalCode})`;
+        throw new Error(
+          `WebView2 DevTools port ${port} never opened; ${state}.\n` +
+            `last connect error: ${err instanceof Error ? err.message : String(err)}\n` +
+            `app stderr tail:\n${stderrTail}\n` +
+            `WebView2 processes under app.exe:\n${webviewProcesses(app.pid!)}`,
+        );
+      }
       await new Promise((r) => setTimeout(r, 250));
     }
   }
