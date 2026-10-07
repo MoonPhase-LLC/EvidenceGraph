@@ -26,6 +26,9 @@ dev = [
     "pytest>=8.3,<9.0",
     "ruff>=0.8,<0.9",
 ]
+package = [
+    "pyinstaller>=6.11,<7",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -48,7 +51,7 @@ select = ["E", "F", "I", "UP", "B", "S"]
 python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
-files = ["src", "tests"]
+files = ["src", "tests", "packaging"]
 
 [[tool.mypy.overrides]]
 module = "tests.*"

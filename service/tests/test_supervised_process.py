@@ -28,6 +28,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from typing import IO, Any
 
 import httpx
@@ -63,13 +64,27 @@ def _read_frame_with_timeout(stream: IO[bytes], *, timeout: float) -> dict[str, 
         executor.shutdown(wait=False)
 
 
-def _spawn() -> subprocess.Popen[bytes]:
+@pytest.fixture(scope="module")
+def service_argv(request: pytest.FixtureRequest) -> list[str]:
+    """How to launch the supervised service: by default this interpreter's
+    `-m evidencegraph_service`; with `--service-exe` (S1-09), the packaged
+    executable instead, so this whole suite also checks the frozen build."""
+    exe = request.config.getoption("--service-exe")
+    if exe is None:
+        return [sys.executable, "-m", "evidencegraph_service", "--supervised"]
+    path = Path(exe).resolve()
+    if not path.is_file():
+        pytest.fail(f"--service-exe {path} does not exist")
+    return [str(path), "--supervised"]
+
+
+def _spawn(argv: list[str]) -> subprocess.Popen[bytes]:
     env = dict(os.environ)
     for key in list(env):
         if key.startswith("EVIDENCEGRAPH_"):
             del env[key]
     return subprocess.Popen(  # noqa: S603 -- fixed argv, no shell, no untrusted input
-        [sys.executable, "-m", "evidencegraph_service", "--supervised"],
+        argv,
         env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -184,8 +199,8 @@ class _FakeTauri:
 
 
 @pytest.fixture
-def tauri() -> Iterator[_FakeTauri]:
-    fake = _FakeTauri(process=_spawn())
+def tauri(service_argv: list[str]) -> Iterator[_FakeTauri]:
+    fake = _FakeTauri(process=_spawn(service_argv))
     try:
         yield fake
     finally:
@@ -368,7 +383,7 @@ def test_no_secret_or_probe_content_and_no_traceback_in_logs(tauri: _FakeTauri) 
 _SECRET_MARKER = "MARKER-SECRET-VALUE-DO-NOT-LEAK-9f3a7c1e"
 
 
-def test_secret_markers_in_malformed_frames_never_appear_in_logs() -> None:
+def test_secret_markers_in_malformed_frames_never_appear_in_logs(service_argv: list[str]) -> None:
     """S1-04 review finding 4 regression test: place a recognizable
     synthetic value inside *every* interesting field of a malformed first
     message and confirm it never surfaces in captured stdout/stderr. An
@@ -391,7 +406,7 @@ def test_secret_markers_in_malformed_frames_never_appear_in_logs() -> None:
     ]
 
     for frame in malformed_frames:
-        fake = _FakeTauri(process=_spawn())
+        fake = _FakeTauri(process=_spawn(service_argv))
         try:
             fake.send_raw(frame)
             fake.process.wait(timeout=_READY_TIMEOUT_SECONDS)
