@@ -10,7 +10,7 @@ def test_health_with_valid_credential_returns_200_and_expected_shape(
 ) -> None:
     response = client.get("/health", headers=auth_headers)
 
-    assert response.status_code == 201  # DELIBERATE FAILURE (S1-07 CI check), reverted next commit
+    assert response.status_code == 200
     body = response.json()
     assert body == {
         "status": "ok",
