@@ -99,7 +99,7 @@ with `npx playwright install chromium`.
 | `npm run typecheck:test` | `tsc -p tsconfig.test.json` | Strict typecheck of all test code, including the Playwright specs and the Vite/Vitest/Playwright configs, which `npm run build` does not cover |
 | `npm test` | Vitest (jsdom + Testing Library) | `src/**/*.test.ts(x)`: the `useLocalService` hook and the app shell, with Tauri IPC mocked |
 | `npm run test:e2e` | Playwright, Chromium | Browser smoke test: the real frontend served by the Vite dev server, with IPC mocked |
-| `npm run test:e2e:native` | Playwright over WebView2 (Windows only, opt-in) | Native smoke test: the real debug Tauri app, with real supervision and the real service |
+| `npm run test:e2e:native` | Playwright over WebView2 (Windows only, opt-in) | Native smoke test: the real debug Tauri app, with real supervision and the real service. Not run in CI (hosted runners ignore its WebView2 DevTools-port override; see `CONTRIBUTING.md`), so run it locally |
 
 Each command exits non-zero when a test fails.
 

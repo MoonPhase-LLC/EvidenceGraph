@@ -193,4 +193,22 @@ npm run test:e2e:native     # opt-in, Windows: real debug Tauri app + real servi
 ```
 
 The native smoke test needs `uv sync` in `service/` and `npm run tauri build -- --debug
---no-bundle` first. No CI runs any of these yet (S1-07).
+--no-bundle` first.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request targeting `main` and every push to `main`
+(read-only token, no secrets, no deployment). All jobs must pass:
+
+| Job | Runner | Checks |
+|---|---|---|
+| Frontend | ubuntu | `npm ci`, `npm run lint`, `npm run build` (strict typecheck + build), `npm run typecheck:test`, `npm test` |
+| Browser smoke | ubuntu | `npx playwright install --with-deps chromium`, `npm run test:e2e` (traces uploaded on failure, kept 7 days) |
+| Service | ubuntu 3.11 and 3.12, windows 3.12 | `uv lock --check`, `uv sync --frozen`, Ruff lint and format check, mypy, pytest |
+| Rust supervisor | windows | builds the frontend, `uv sync --frozen` in `service/`, then `cargo fmt --check`, Clippy with `-D warnings`, `cargo test` |
+
+The **native smoke test is not run in CI**. On GitHub-hosted Windows runners WebView2 ignores both
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` and the per-app registry override, so the test cannot
+open the DevTools port it attaches through (evidence in the S1-07 status note in
+`docs/SPRINT_1_BACKLOG.md`). Run `npm run test:e2e:native` locally before merging changes to
+service supervision or the native shell.

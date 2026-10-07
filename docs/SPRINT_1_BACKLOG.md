@@ -236,6 +236,35 @@ broken test causes CI to fail; a clean state passes.
 
 **Required tests:** N/A (this ticket is the test infrastructure).
 
+**Status (S1-07 implementation, PR #10):** `.github/workflows/ci.yml` runs the frontend checks
+(ESLint, strict typecheck + build, test-code typecheck, Vitest), the Playwright browser smoke test,
+the service checks (Ruff, mypy, pytest on Python 3.11/3.12, Ubuntu and Windows), and the Rust
+supervisor checks on Windows (fmt, Clippy `-D warnings`, real-process `cargo test`). See
+`CONTRIBUTING.md` → Continuous integration.
+
+The **native Windows smoke test is not in CI**. It was run on `windows-latest`, with the debug app
+and frontend rebuilt from the checkout, and failed every time for the same reason. `app.exe` and
+the supervised service started, but the WebView2 browser process never received
+`--remote-debugging-port`, so Playwright could not attach:
+- run 37646355060: WebView2 153.0.4234.48. No Edge/WebView2 policy keys were present.
+- run 37647302465: runtime updated to 154.0.4258.62, the same version that passes locally. The
+  flag was still missing.
+- run 37648304766: the runner process is elevated (Administrators role active). Two mechanisms
+  had no effect: `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` on a direct launch, and the per-exe
+  `HKCU\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments` override. No
+  listener opened in either case.
+
+Locally, in a non-elevated session, the same runtime does append the flag, and the test passes.
+Elevation is the likely difference but is unconfirmed.
+
+**Follow-up (unscheduled):** run the native smoke test in CI. Two possible options:
+1. Run the test on a non-elevated or self-hosted Windows runner.
+2. Add a debug-only, test-gated way for the app to pass WebView2 browser arguments.
+
+Option 2 changes the app and opens a DevTools port, so it needs the product owner's
+security/architecture approval first. Until then, `npm run test:e2e:native` is a local
+pre-merge check.
+
 ---
 
 ### S1-08: Sprint 1 exit validation
