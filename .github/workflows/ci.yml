@@ -229,3 +229,43 @@ jobs:
       - name: cargo test (unit + real-process supervisor tests)
         working-directory: app/src-tauri
         run: cargo test --all-targets --all-features
+
+  # S1-09: freeze the service the way the installer does (PyInstaller,
+  # --onedir, isolated build environment) and run the supervised end-to-end
+  # suite against the frozen executable. Catches missing hidden imports and
+  # dev packages leaking into the bundle. The full installer build and the
+  # clean-machine check are manual (docs/PACKAGING.md).
+  packaged-service-windows:
+    name: Packaged service (Windows, PyInstaller)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10.2.0 # no floating major tag is published
+        with:
+          enable-cache: true
+          cache-dependency-glob: service/uv.lock
+
+      # Single command: the script checks each native command's exit code.
+      - name: Freeze the service and check the bundle contents
+        run: ./scripts/package-windows.ps1 -ServiceOnly
+
+      - name: Install the service test environment (frozen)
+        working-directory: service
+        run: uv sync --frozen
+
+      - name: Supervised end-to-end tests against the frozen executable
+        working-directory: service
+        run: uv run --frozen pytest tests/test_supervised_process.py --service-exe dist/pyinstaller/evidencegraph-service/evidencegraph-service.exe
+
+      - name: Upload PyInstaller diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyinstaller-warnings
+          path: service/build/pyinstaller/**/warn-*.txt
+          retention-days: 7
+          if-no-files-found: ignore

@@ -17,6 +17,17 @@ VALID_TOKEN = "test-only-session-token-abcdef12"
 SettingsFactory = Callable[..., Settings]
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--service-exe",
+        default=None,
+        help=(
+            "Run the supervised-process tests against this packaged service executable "
+            "(S1-09; see docs/PACKAGING.md) instead of `python -m evidencegraph_service`."
+        ),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strips any ambient `EVIDENCEGRAPH_*` variables from the real shell so
